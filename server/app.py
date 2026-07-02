@@ -414,6 +414,28 @@ def create_app():
             "version": VERSION,
         })
 
+    @app.route("/api/files/<path:key>/session", methods=["GET"])
+    def check_file_session(key):
+        """Check if the current session (cookie) has access to this protected file."""
+        filename = key[5:] if key.startswith("file:") else key
+        cookie_name = f"file_token_{filename}"
+        token = request.cookies.get(cookie_name, "")
+
+        meta = metadata.get_file_meta(key)
+        has_password = bool(meta and meta.get("password"))
+
+        if not has_password:
+            return jsonify({"success": True, "hasAccess": True, "hasPassword": False})
+
+        is_valid = False
+        if token and token in _access_tokens:
+            token_data = _access_tokens[token]
+            if (token_data["filename"] == filename and
+                token_data["password_hash"] == hashlib.sha256(meta["password"].encode()).hexdigest()[:16]):
+                is_valid = True
+
+        return jsonify({"success": True, "hasAccess": is_valid, "hasPassword": has_password})
+
     @app.route("/api/files/<path:key>/password", methods=["POST"])
     def check_password(key):
         """Check if the provided password is correct and set HttpOnly cookie for access."""
@@ -440,7 +462,7 @@ def create_app():
                 max_age=365 * 24 * 60 * 60,  # 1 year
                 httponly=True,
                 samesite="Lax",
-                path=f"/protected/"  # Cookie sent only for /protected/* requests
+                path="/"  # Must be / so both /api/* and /protected/* receive it
             )
             return resp
         else:

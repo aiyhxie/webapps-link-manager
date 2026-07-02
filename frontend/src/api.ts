@@ -56,6 +56,11 @@ export const api = {
     return res.json();
   },
 
+  async checkFileSession(key: string): Promise<ApiResponse & { hasAccess?: boolean; hasPassword?: boolean }> {
+    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}/session`);
+    return res.json();
+  },
+
   async checkPassword(key: string, password: string): Promise<ApiResponse<{ token?: string }>> {
     const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}/password`, {
       method: 'POST',

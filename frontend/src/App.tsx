@@ -430,11 +430,18 @@ function App() {
 
   const handleCardClick = (file: FileInfo) => {
     if (file.hasPassword) {
-      // Password protected - show password modal
-      // Token is stored in HttpOnly cookie on the server, not in URL
-      setAccessFile(file);
-      setAccessPassword('');
-      setAccessModalVisible(true);
+      // Check if session is already authenticated before showing password modal
+      api.checkFileSession(file.key).then(result => {
+        if (result.success && result.hasAccess) {
+          // Session authenticated - open directly
+          window.open(file.url, '_blank');
+        } else {
+          // Not authenticated - show password modal
+          setAccessFile(file);
+          setAccessPassword('');
+          setAccessModalVisible(true);
+        }
+      });
     } else {
       window.open(file.url, '_blank');
     }
