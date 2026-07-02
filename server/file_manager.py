@@ -25,6 +25,27 @@ import re
 import sys
 import zipfile
 import shutil
+from pathlib import Path
+
+
+def safe_filename(raw_name: str) -> str:
+    """
+    Sanitize a filename to prevent path traversal attacks.
+    - Returns only the basename (no directory components)
+    - Rejects any path components containing '..'
+    - Strips dangerous characters
+    """
+    # Reject if '..' anywhere in the raw name (before and after basename)
+    if '..' in raw_name:
+        return ''
+    # Get just the basename (removes directory components)
+    name = os.path.basename(raw_name)
+    # Reject empty result or suspicious names
+    if not name or name.startswith('.'):
+        return ''
+    # Accept only alphanumeric, Chinese chars, spaces, dashes, underscores, dots, parens
+    safe = re.sub(r'[^\w\s一-鿿.\-()（）]', '', name)
+    return safe.strip()
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -348,10 +369,14 @@ def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool
         return False, "只支持 HTML 文件", ""
 
     try:
-        # Handle filename to prevent path traversal
-        safe_filename = os.path.basename(filename)
-        dest_path = WEBAPPS_DIR / safe_filename
-        key = f"file:{safe_filename}"
+        # Safe filename - prevent path traversal
+        safe = safe_filename(filename)
+        if not safe:
+            return False, "无效的文件名", ""
+        if not safe.lower().endswith(".html"):
+            return False, "只支持 HTML 文件", ""
+        dest_path = WEBAPPS_DIR / safe
+        key = f"file:{safe}"
 
         # Check if file already exists (new version scenario)
         if dest_path.exists():
@@ -360,7 +385,7 @@ def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool
             old_meta = metadata.get_file_meta(key)
             prev_version = old_meta.get("current_version", "V1") if old_meta else "V1"
             # Save old content to versions directory with version suffix
-            version_filename = f"{safe_filename}__{prev_version}"
+            version_filename = f"{safe}__{prev_version}"
             version_path = VERSIONS_DIR / version_filename
             version_path.write_bytes(old_content)
             # Add new version to metadata
@@ -376,7 +401,7 @@ def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool
 
         # Use filename as title if no title found in HTML
         if not title:
-            title = safe_filename
+            title = safe
 
         # Auto-detect product line from title and description
         product_line = detect_product_line(title, description)
@@ -406,7 +431,7 @@ def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool
         current_v = versions_info.get("current_version", "V1")
         if dest_path.exists() and existing_meta:
             return True, f"已更新为 {current_v} 版本", key
-        return True, f"已上传 {safe_filename}", key
+        return True, f"已上传 {safe}", key
     except Exception as e:
         return False, f"上传失败: {str(e)}", ""
 
@@ -545,6 +570,14 @@ def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]
                     continue
 
                 file_path = extract_to / rel_path
+                # Zip Slip protection: ensure resolved path stays within extract_to
+                try:
+                    resolved = file_path.resolve()
+                    if not str(resolved).startswith(str(extract_to.resolve())):
+                        continue  # skip files that would escape extraction dir
+                except (OSError, ValueError):
+                    continue
+
                 file_path.parent.mkdir(parents=True, exist_ok=True)
 
                 try:

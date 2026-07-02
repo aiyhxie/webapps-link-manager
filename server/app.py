@@ -407,8 +407,10 @@ def create_app():
         """Upload a new version for an existing file."""
         client_ip = get_client_ip()
 
-        # Check permission - allow if can_delete OR admin OR file has no metadata (legacy file)
+        # Resolve filename from key once
         filename = key[5:] if key.startswith("file:") else key
+
+        # Check permission - allow if can_delete OR admin OR file has no metadata (legacy file)
         has_meta = metadata.get_file_meta(key) is not None
         has_physical = (WEBAPPS_DIR / filename).exists()
         if not has_meta and not has_physical:
@@ -419,18 +421,20 @@ def create_app():
         if "file" not in request.files:
             return jsonify({"success": False, "message": "没有上传文件"}), 400
 
-        file = request.files["file"]
-        if file.filename == "":
+        upload_file = request.files["file"]
+        if upload_file.filename == "":
             return jsonify({"success": False, "message": "文件名为空"}), 400
 
-        original_filename = file.filename
-        original_lower = original_filename.lower()
-        file_data = file.read()
-        filename = key[5:] if key.startswith("file:") else key
+        original_lower = upload_file.filename.lower()
+
+        if not (original_lower.endswith(".zip") or original_lower.endswith(".html")):
+            return jsonify({"success": False, "message": "只支持 HTML 或 ZIP 文件"}), 400
+
+        file_data = upload_file.read()
 
         if original_lower.endswith(".zip"):
-            # Handle ZIP: extract and use the main HTML content
-            success, msg, keys = file_manager.extract_zip_for_version(file_data, filename, client_ip)
+            # Handle ZIP: extract and update version
+            success, msg, _ = file_manager.extract_zip_for_version(file_data, filename, client_ip)
             if success:
                 versions_info = metadata.get_versions(key)
                 current_v = versions_info.get("current_version", "V1")
@@ -438,17 +442,16 @@ def create_app():
                 return jsonify({"success": True, "message": msg, "version": current_v})
             else:
                 return jsonify({"success": False, "message": msg}), 400
-        elif original_lower.endswith(".html"):
-            # Handle HTML: archive old content and save new
-            success, message, returned_key = file_manager.upload_file(file_data, filename, client_ip)
-        if success:
-            # Get current version
-            versions_info = metadata.get_versions(key)
-            current_v = versions_info.get("current_version", "V1")
-            log_file_action("上传新版本", f"{key} -> {current_v}")
-            return jsonify({"success": True, "message": message, "version": current_v})
         else:
-            return jsonify({"success": False, "message": message}), 400
+            # Handle HTML: archive old content and save new
+            success, message, _ = file_manager.upload_file(file_data, filename, client_ip)
+            if success:
+                versions_info = metadata.get_versions(key)
+                current_v = versions_info.get("current_version", "V1")
+                log_file_action("上传新版本", f"{key} -> {current_v}")
+                return jsonify({"success": True, "message": message, "version": current_v})
+            else:
+                return jsonify({"success": False, "message": message}), 400
 
     @app.route("/api/files/<path:key>/versions/<version>/restore", methods=["PUT"])
     def restore_version(key, version):
