@@ -416,7 +416,7 @@ def create_app():
 
     @app.route("/api/files/<path:key>/password", methods=["POST"])
     def check_password(key):
-        """Check if the provided password is correct and return a permanent access token."""
+        """Check if the provided password is correct and set HttpOnly cookie for access."""
         data = request.get_json()
         password = data.get("password", "") if data else ""
 
@@ -432,7 +432,17 @@ def create_app():
                 "filename": filename,
             }
             log_file_action("访问受保护文件", f"{key} - 密码验证成功")
-            return jsonify({"success": True, "message": "密码正确", "data": {"token": token}})
+            # Set HttpOnly cookie instead of returning token in response body
+            resp = jsonify({"success": True, "message": "密码正确"})
+            resp.set_cookie(
+                f"file_token_{filename}",
+                token,
+                max_age=365 * 24 * 60 * 60,  # 1 year
+                httponly=True,
+                samesite="Lax",
+                path=f"/protected/"  # Cookie sent only for /protected/* requests
+            )
+            return resp
         else:
             log_file_action("访问受保护文件", f"{key} - 密码错误")
             return jsonify({"success": False, "message": "密码错误"}), 401
@@ -590,7 +600,7 @@ def create_app():
 
     @app.route("/protected/<path:filename>")
     def serve_protected_file(filename):
-        """Serve password-protected files using token."""
+        """Serve password-protected files using HttpOnly cookie token."""
         key = f"file:{filename}"
         meta = metadata.get_file_meta(key)
 
@@ -599,8 +609,9 @@ def create_app():
             log_file_action("访问文件", filename)
             return send_from_directory(WEBAPPS_DIR, filename)
 
-        # Check token from query param
-        token = request.args.get("token", "")
+        # Check token from cookie (secure, not in URL)
+        cookie_name = f"file_token_{filename}"
+        token = request.cookies.get(cookie_name, "")
 
         # Validate token
         is_valid_token = False
@@ -652,8 +663,10 @@ def create_app():
                             body: JSON.stringify({password: pwd})
                         });
                         const data = await resp.json();
-                        if (data.success && data.token) {
-                            window.location.href = window.location.pathname + '?token=' + data.token;
+                        if (data.success) {
+                            // Password correct, cookie is set by server via Set-Cookie header
+                            // Reload to re-check cookie and serve the file
+                            window.location.reload();
                         } else {
                             document.getElementById('errorMsg').style.display = 'block';
                         }

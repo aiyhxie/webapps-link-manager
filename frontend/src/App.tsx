@@ -420,8 +420,6 @@ function App() {
     if (!passwordFile) return;
     const result = await api.updateFile(passwordFile.key, { password: '' });
     if (result.success) {
-      // Clear cached token
-      localStorage.removeItem(`token_${passwordFile.key}`);
       message.success('密码已清除');
       setPasswordModalVisible(false);
       loadFiles();
@@ -432,15 +430,11 @@ function App() {
 
   const handleCardClick = (file: FileInfo) => {
     if (file.hasPassword) {
-      const storedToken = localStorage.getItem(`token_${file.key}`);
-      if (storedToken) {
-        const urlWithToken = `${file.url}?token=${storedToken}`;
-        window.open(urlWithToken, '_blank');
-      } else {
-        setAccessFile(file);
-        setAccessPassword('');
-        setAccessModalVisible(true);
-      }
+      // Password protected - show password modal
+      // Token is stored in HttpOnly cookie on the server, not in URL
+      setAccessFile(file);
+      setAccessPassword('');
+      setAccessModalVisible(true);
     } else {
       window.open(file.url, '_blank');
     }
@@ -449,14 +443,12 @@ function App() {
   const handleAccessSubmit = async () => {
     if (!accessFile) return;
     const result = await api.checkPassword(accessFile.key, accessPassword);
-    if (result.success && result.data?.token) {
-      // Store token persistently in localStorage
-      localStorage.setItem(`token_${accessFile.key}`, result.data.token);
-      const urlWithToken = `${accessFile.url}?token=${result.data.token}`;
+    if (result.success) {
+      // Token is stored in HttpOnly cookie by the server
+      // Just close modal and open the file - browser will send cookie automatically
       setAccessModalVisible(false);
-      // Delay to ensure modal closes before navigation
       setTimeout(() => {
-        window.open(urlWithToken, '_blank');
+        window.open(accessFile.url, '_blank');
       }, 100);
     } else {
       message.error(result.message || '密码错误');
