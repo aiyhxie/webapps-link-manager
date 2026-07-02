@@ -1,0 +1,29 @@
+# Dependencies
+frontend/node_modules/
+frontend/dist/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# User data (exclude uploaded files and runtime data)
+webapps/
+logs/
+metadata.json
+version_iteration.json
+归档.zip
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
