@@ -427,11 +427,13 @@ def create_app():
         if not has_password:
             return jsonify({"success": True, "hasAccess": True, "hasPassword": False})
 
+        # Validate token against stored plain-text password (consistent with check_password)
         is_valid = False
+        stored_password = meta.get("password", "")
         if token and token in _access_tokens:
             token_data = _access_tokens[token]
-            if (token_data["filename"] == filename and
-                token_data["password_hash"] == hashlib.sha256(meta["password"].encode()).hexdigest()[:16]):
+            # Compare plain-text password directly
+            if token_data["filename"] == filename and token_data["password"] == stored_password:
                 is_valid = True
 
         return jsonify({"success": True, "hasAccess": is_valid, "hasPassword": has_password})
@@ -443,14 +445,12 @@ def create_app():
         password = data.get("password", "") if data else ""
 
         if metadata.check_file_password(key, password):
-            # Generate token with password hash bound to it
-            pwd_hash = hashlib.sha256(password.encode()).hexdigest()[:16]
             token = secrets.token_urlsafe(32)
             # Get filename from key
             filename = key[5:] if key.startswith("file:") else key
-            # Store token permanently, bound to password hash
+            # Store token permanently, bound to plain-text password (for consistent comparison)
             _access_tokens[token] = {
-                "password_hash": pwd_hash,
+                "password": password,
                 "filename": filename,
             }
             log_file_action("访问受保护文件", f"{key} - 密码验证成功")
@@ -639,10 +639,9 @@ def create_app():
         is_valid_token = False
         if token and token in _access_tokens:
             token_data = _access_tokens[token]
-            # Check filename and password hash match
-            current_pwd_hash = hashlib.sha256(meta["password"].encode()).hexdigest()[:16]
+            # Check filename and plain-text password match (consistent with check_password)
             if (token_data["filename"] == filename and
-                token_data["password_hash"] == current_pwd_hash):
+                token_data["password"] == meta["password"]):
                 is_valid_token = True
                 # Token remains valid for reuse
 
