@@ -1018,16 +1018,21 @@ function App() {
                               </span>
                             </Tooltip>
                             {file.currentVersion && (
-                              <span style={{
-                                fontSize: 11,
-                                color: textSecondary,
-                                background: currentTheme === 'dark' ? 'rgba(255,255,255,0.1)' : '#f1f3f4',
-                                padding: '2px 6px',
-                                borderRadius: 4,
-                                flexShrink: 0,
-                              }}>
-                                {file.currentVersion}
-                              </span>
+                              <Tooltip title="查看版本历史">
+                                <span
+                                  onClick={(e) => { e.stopPropagation(); handleShowVersions(file); }}
+                                  style={{
+                                    fontSize: 11,
+                                    color: textSecondary,
+                                    background: currentTheme === 'dark' ? 'rgba(255,255,255,0.1)' : '#f1f3f4',
+                                    padding: '2px 6px',
+                                    borderRadius: 4,
+                                    flexShrink: 0,
+                                    cursor: 'pointer',
+                                  }}>
+                                  {file.currentVersion}
+                                </span>
+                              </Tooltip>
                             )}
                             {file.hasPassword && (
                               <Tooltip title={file.canDelete ? '已加密，点击修改' : '已加密'}>
@@ -1124,16 +1129,6 @@ function App() {
                                 onClick={(e) => { e.stopPropagation(); copyToClipboard(fullUrl); }}
                                 style={{ flexShrink: 0 }}
                               />
-                            </Tooltip>
-                            <Tooltip title="版本历史">
-                              <Button
-                                size="small"
-                                type="text"
-                                onClick={(e) => { e.stopPropagation(); handleShowVersions(file); }}
-                                style={{ color: textSecondary, flexShrink: 0 }}
-                              >
-                                版本历史
-                              </Button>
                             </Tooltip>
                             {file.canDelete && (
                               <Popconfirm
