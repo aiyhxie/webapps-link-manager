@@ -438,7 +438,9 @@ def create_app():
         if token and token in _access_tokens:
             token_data = _access_tokens[token]
             # Compare plain-text password directly
-            if token_data["filename"] == filename and token_data["password"] == stored_password:
+            # Also check password hasn't changed since token was issued
+            if (token_data["filename"] == filename and
+                token_data["password"] == stored_password):
                 is_valid = True
 
         return jsonify({"success": True, "hasAccess": is_valid, "hasPassword": has_password})
