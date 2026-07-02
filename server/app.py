@@ -80,6 +80,11 @@ _access_tokens: Dict[str, Dict] = {}
 _admin_sessions: Dict[str, str] = {}
 
 
+def _safe_cookie_name(filename: str) -> str:
+    """Generate a safe cookie name from filename - replaces / with _ to avoid cookie parsing issues."""
+    return f"file_token_{filename.replace('/', '_')}"
+
+
 def create_app():
     app = Flask(__name__, template_folder="templates")
     app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100MB max upload
@@ -418,7 +423,7 @@ def create_app():
     def check_file_session(key):
         """Check if the current session (cookie) has access to this protected file."""
         filename = key[5:] if key.startswith("file:") else key
-        cookie_name = f"file_token_{filename}"
+        cookie_name = _safe_cookie_name(filename)
         token = request.cookies.get(cookie_name, "")
 
         meta = metadata.get_file_meta(key)
@@ -457,7 +462,7 @@ def create_app():
             # Set HttpOnly cookie instead of returning token in response body
             resp = jsonify({"success": True, "message": "密码正确"})
             resp.set_cookie(
-                f"file_token_{filename}",
+                _safe_cookie_name(filename),
                 token,
                 max_age=365 * 24 * 60 * 60,  # 1 year
                 httponly=True,
@@ -632,7 +637,7 @@ def create_app():
             return send_from_directory(WEBAPPS_DIR, filename)
 
         # Check token from cookie (secure, not in URL)
-        cookie_name = f"file_token_{filename}"
+        cookie_name = _safe_cookie_name(filename)
         token = request.cookies.get(cookie_name, "")
 
         # Validate token
