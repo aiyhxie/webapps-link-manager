@@ -390,6 +390,97 @@ def create_app():
 
         return jsonify({"success": True, "message": "已更新"})
 
+    @app.route("/api/files/<path:key>/versions", methods=["GET"])
+    def get_versions(key):
+        """Get all versions for a file."""
+        meta = metadata.get_file_meta(key)
+        if not meta:
+            return jsonify({"success": False, "message": "文件不存在"}), 404
+        versions_info = metadata.get_versions(key)
+        return jsonify({
+            "success": True,
+            "data": versions_info,
+        })
+
+    @app.route("/api/files/<path:key>/versions", methods=["POST"])
+    def upload_new_version(key):
+        """Upload a new version for an existing file."""
+        client_ip = get_client_ip()
+
+        # Check permission - allow if can_delete OR admin OR file has no metadata (legacy file)
+        filename = key[5:] if key.startswith("file:") else key
+        has_meta = metadata.get_file_meta(key) is not None
+        has_physical = (WEBAPPS_DIR / filename).exists()
+        if not has_meta and not has_physical:
+            return jsonify({"success": False, "message": "文件不存在"}), 404
+        if has_meta and not file_manager.can_delete(key, client_ip) and not get_current_admin():
+            return jsonify({"success": False, "message": "无权更新此项目"}), 403
+
+        if "file" not in request.files:
+            return jsonify({"success": False, "message": "没有上传文件"}), 400
+
+        file = request.files["file"]
+        if file.filename == "":
+            return jsonify({"success": False, "message": "文件名为空"}), 400
+
+        original_filename = file.filename
+        original_lower = original_filename.lower()
+
+        if not original_lower.endswith(".html"):
+            return jsonify({"success": False, "message": "只支持 HTML 文件"}), 400
+
+        file_data = file.read()
+        filename = key[5:] if key.startswith("file:") else key
+
+        # Use upload_file which handles version archiving
+        success, message, returned_key = file_manager.upload_file(file_data, filename, client_ip)
+        if success:
+            # Get current version
+            versions_info = metadata.get_versions(key)
+            current_v = versions_info.get("current_version", "V1")
+            log_file_action("上传新版本", f"{key} -> {current_v}")
+            return jsonify({"success": True, "message": message, "version": current_v})
+        else:
+            return jsonify({"success": False, "message": message}), 400
+
+    @app.route("/api/files/<path:key>/versions/<version>/restore", methods=["PUT"])
+    def restore_version(key, version):
+        """Restore a historical version as the current version."""
+        client_ip = get_client_ip()
+        admin_user = get_current_admin()
+
+        if not file_manager.can_delete(key, client_ip) and not admin_user:
+            return jsonify({"success": False, "message": "无权恢复此版本"}), 403
+
+        success, message = file_manager.restore_version_file(key, version, client_ip)
+        if success:
+            if admin_user:
+                log_admin_action(admin_user, "恢复版本", f"{key} -> {version}")
+            else:
+                log_file_action("恢复版本", f"{key} -> {version}")
+            return jsonify({"success": True, "message": message})
+        else:
+            return jsonify({"success": False, "message": message}), 400
+
+    @app.route("/api/files/<path:key>/versions/<version>", methods=["DELETE"])
+    def delete_version(key, version):
+        """Delete a historical version."""
+        client_ip = get_client_ip()
+        admin_user = get_current_admin()
+
+        if not file_manager.can_delete(key, client_ip) and not admin_user:
+            return jsonify({"success": False, "message": "无权删除此版本"}), 403
+
+        success, message = file_manager.delete_version_file(key, version, client_ip)
+        if success:
+            if admin_user:
+                log_admin_action(admin_user, "删除版本", f"{key} {version}")
+            else:
+                log_file_action("删除版本", f"{key} {version}")
+            return jsonify({"success": True, "message": message})
+        else:
+            return jsonify({"success": False, "message": message}), 400
+
     @app.route("/api/files/<path:key>", methods=["DELETE"])
     def delete_file(key):
         """Delete a file (requires IP match)."""
@@ -715,6 +806,46 @@ def create_app():
         """Serve static assets (JS/CSS) from templates/assets/."""
         assets_dir = Path(__file__).parent / "templates" / "assets"
         return send_from_directory(assets_dir, filename)
+
+    @app.route("/versions/<path:filename>/<version>")
+    def serve_version(filename, version):
+        """Serve a historical version of a file."""
+        key = f"file:{filename}"
+
+        # Check password protection
+        meta = metadata.get_file_meta(key)
+        if meta and meta.get("password"):
+            # Check if user has valid cookie for this file
+            cookie_name = _safe_cookie_name(filename)
+            token = request.cookies.get(cookie_name, "")
+            is_valid_token = False
+            if token and token in _access_tokens:
+                token_data = _access_tokens[token]
+                if (token_data["filename"] == filename and
+                    token_data["password"] == meta["password"]):
+                    is_valid_token = True
+            if not is_valid_token:
+                return """
+                <!DOCTYPE html>
+                <html><head><meta charset="utf-8"><title>需要密码访问</title></head>
+                <body style="font-family:sans-serif;text-align:center;padding:60px;">
+                <h2>🔒 此文件已加密，请从主页输入密码后访问</h2>
+                <p><a href="/">返回首页</a></p></body></html>
+                """, 401
+
+        # Try historical version first
+        content = file_manager.get_version_content(filename, version)
+        if content is not None:
+            log_file_action("访问历史版本", f"{filename} {version}")
+            return content, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+        # Fall back to current version
+        content = file_manager.get_current_content(filename)
+        if content is not None:
+            log_file_action("访问文件(版本降级)", f"{filename} (requested {version}, showing current)")
+            return content, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+        return "文件不存在", 404
 
     # ── SPA Fallback ─────────────────────────────────────────────────────────────
 

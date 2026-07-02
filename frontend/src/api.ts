@@ -12,7 +12,7 @@
  * - 系统状态：getStatus
  */
 
-import type { FileInfo, ApiResponse } from './types';
+import type { FileInfo, ApiResponse, VersionsResponse } from './types';
 
 // API 基础路径
 const API_BASE = '/api';
@@ -66,6 +66,36 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password }),
+    });
+    return res.json();
+  },
+
+  // Version management APIs
+  async getVersions(key: string): Promise<ApiResponse & { data?: VersionsResponse }> {
+    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}/versions`);
+    return res.json();
+  },
+
+  async uploadNewVersion(key: string, file: File): Promise<ApiResponse & { version?: string }> {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}/versions`, {
+      method: 'POST',
+      body: formData,
+    });
+    return res.json();
+  },
+
+  async restoreVersion(key: string, version: string): Promise<ApiResponse> {
+    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}/versions/${version}/restore`, {
+      method: 'PUT',
+    });
+    return res.json();
+  },
+
+  async deleteVersion(key: string, version: string): Promise<ApiResponse> {
+    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}/versions/${version}`, {
+      method: 'DELETE',
     });
     return res.json();
   },

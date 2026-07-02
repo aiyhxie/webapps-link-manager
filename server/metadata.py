@@ -36,7 +36,7 @@ metadata.json 格式：
 import json
 import sys
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 
 # Add server directory to path for imports
@@ -88,6 +88,129 @@ def update_file_meta(key: str, title: str = None, description: str = None, produ
     save_metadata(meta)
 
 
+# ── Version Management ────────────────────────────────────────────────────────
+
+def init_versions(key: str, uploader_ip: str) -> str:
+    """
+    Initialize the versions dict for a file when first uploaded.
+    Returns the first version string 'V1'.
+    """
+    meta = load_metadata()
+    if key not in meta:
+        meta[key] = {}
+    if "versions" not in meta[key]:
+        meta[key]["versions"] = {}
+    if "current_version" not in meta[key]:
+        meta[key]["current_version"] = "V1"
+        meta[key]["versions"]["V1"] = {
+            "upload_time": meta[key].get("upload_time", datetime.now().isoformat()),
+            "uploader_ip": uploader_ip or meta[key].get("uploader_ip", ""),
+        }
+        save_metadata(meta)
+    return meta[key]["current_version"]
+
+
+def add_version(key: str, uploader_ip: str) -> str:
+    """
+    Add a new version entry for an existing file.
+    Returns the new version string (e.g. 'V4').
+    """
+    meta = load_metadata()
+    if key not in meta:
+        return ""
+    if "versions" not in meta[key]:
+        meta[key]["versions"] = {}
+    if "current_version" not in meta[key]:
+        meta[key]["current_version"] = "V1"
+        meta[key]["versions"]["V1"] = {
+            "upload_time": datetime.now().isoformat(),
+            "uploader_ip": uploader_ip,
+        }
+        save_metadata(meta)
+        return "V1"
+
+    # Increment version number
+    current = meta[key]["current_version"]
+    # Parse version number from "V3" -> 3
+    try:
+        current_num = int(current[1:])
+    except:
+        current_num = 1
+
+    new_version = f"V{current_num + 1}"
+    meta[key]["current_version"] = new_version
+    meta[key]["versions"][new_version] = {
+        "upload_time": datetime.now().isoformat(),
+        "uploader_ip": uploader_ip,
+    }
+    save_metadata(meta)
+    return new_version
+
+
+def get_versions(key: str) -> Dict[str, Any]:
+    """Get all versions for a file, including current version info."""
+    meta = load_metadata()
+    if key not in meta:
+        return {}
+    file_meta = meta[key]
+    versions = file_meta.get("versions", {})
+    # Backward compatibility: if versions is empty but file exists, initialize
+    if not versions and file_meta.get("upload_time"):
+        versions = {"V1": {"upload_time": file_meta.get("upload_time", datetime.now().isoformat()), "uploader_ip": file_meta.get("uploader_ip", "")}}
+        current = file_meta.get("current_version", "V1")
+        file_meta["versions"] = versions
+        file_meta["current_version"] = current or "V1"
+        save_metadata(meta)
+    return {
+        "current_version": file_meta.get("current_version", "V1"),
+        "versions": versions,
+    }
+
+
+def get_version_info(key: str, version: str) -> Optional[Dict[str, Any]]:
+    """Get info for a specific version."""
+    meta = load_metadata()
+    if key not in meta:
+        return None
+    versions = meta[key].get("versions", {})
+    return versions.get(version)
+
+
+def restore_version(key: str, version: str) -> Tuple[bool, str]:
+    """
+    Restore a historical version as the current version.
+    Returns (success, message).
+    """
+    meta = load_metadata()
+    if key not in meta:
+        return False, "文件不存在"
+    versions = meta[key].get("versions", {})
+    if version not in versions:
+        return False, f"版本 {version} 不存在"
+    meta[key]["current_version"] = version
+    save_metadata(meta)
+    return True, f"已恢复为 {version}"
+
+
+def delete_version(key: str, version: str) -> Tuple[bool, str]:
+    """
+    Delete a historical version (cannot delete current version).
+    Returns (success, message).
+    """
+    meta = load_metadata()
+    if key not in meta:
+        return False, "文件不存在"
+    versions = meta[key].get("versions", {})
+    current = meta[key].get("current_version", "V1")
+    if version == current:
+        return False, "不能删除当前版本"
+    if version not in versions:
+        return False, f"版本 {version} 不存在"
+    del versions[version]
+    save_metadata(meta)
+    return True, f"已删除 {version}"
+
+
 def set_file_meta(
     key: str,
     title: str,
@@ -113,6 +236,14 @@ def set_file_meta(
         meta[key]["product_line"] = product_line
     if password is not None:
         meta[key]["password"] = password
+    # Initialize version tracking
+    meta[key]["current_version"] = "V1"
+    meta[key]["versions"] = {
+        "V1": {
+            "upload_time": datetime.now().isoformat(),
+            "uploader_ip": uploader_ip,
+        }
+    }
     save_metadata(meta)
 
 

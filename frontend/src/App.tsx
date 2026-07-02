@@ -69,6 +69,11 @@ function App() {
   const [drawerVisible, setDrawerVisible] = useState(false);
   const [passwordModalVisible, setPasswordModalVisible] = useState(false);
   const [passwordFile, setPasswordFile] = useState<FileInfo | null>(null);
+  const [versionModalVisible, setVersionModalVisible] = useState(false);
+  const [versionFile, setVersionFile] = useState<FileInfo | null>(null);
+  const [versionList, setVersionList] = useState<Record<string, { upload_time: string; uploader_ip: string }>>({});
+  const [currentVersion, setCurrentVersion] = useState('');
+  const [versionFileInputKey, setVersionFileInputKey] = useState(0);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     const saved = localStorage.getItem('themeMode');
     return (saved as ThemeMode) || 'auto';
@@ -423,6 +428,77 @@ function App() {
     } else {
       message.error(result.message || '操作失败');
     }
+  };
+
+  // Version management
+  const handleShowVersions = async (file: FileInfo) => {
+    setVersionFile(file);
+    const result = await api.getVersions(file.key);
+    if (result.success && result.data) {
+      setVersionList(result.data.versions || {});
+      setCurrentVersion(result.data.current_version || 'V1');
+    }
+    setVersionModalVisible(true);
+  };
+
+  const handleUploadNewVersion = async (file: File) => {
+    if (!versionFile) return;
+    const result = await api.uploadNewVersion(versionFile.key, file);
+    if (result.success) {
+      message.success(`${versionFile.title} ${result.version} 版本更新成功`);
+      loadFiles();
+      // Refresh version list
+      const vr = await api.getVersions(versionFile.key);
+      if (vr.success && vr.data) {
+        setVersionList(vr.data.versions || {});
+        setCurrentVersion(vr.data.current_version || 'V1');
+      }
+      setVersionFileInputKey(k => k + 1);
+    } else {
+      message.error(result.message || '版本更新失败');
+    }
+  };
+
+  const handleRestoreVersion = async (version: string) => {
+    if (!versionFile) return;
+    const result = await api.restoreVersion(versionFile.key, version);
+    if (result.success) {
+      message.success(`${versionFile.title} 已恢复为 ${version} 版本`);
+      loadFiles();
+      // Refresh version list
+      const vr = await api.getVersions(versionFile.key);
+      if (vr.success && vr.data) {
+        setVersionList(vr.data.versions || {});
+        setCurrentVersion(vr.data.current_version || 'V1');
+      }
+    } else {
+      message.error(result.message || '恢复失败');
+    }
+  };
+
+  const handleDeleteVersion = async (version: string) => {
+    if (!versionFile) return;
+    const result = await api.deleteVersion(versionFile.key, version);
+    if (result.success) {
+      message.success(`已删除 ${version} 版本`);
+      loadFiles();
+      // Refresh version list
+      const vr = await api.getVersions(versionFile.key);
+      if (vr.success && vr.data) {
+        setVersionList(vr.data.versions || {});
+        setCurrentVersion(vr.data.current_version || 'V1');
+      }
+    } else {
+      message.error(result.message || '删除失败');
+    }
+  };
+
+  const handleVersionFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (files && files.length > 0) {
+      handleUploadNewVersion(files[0]);
+    }
+    e.target.value = '';
   };
 
   const handleCardClick = (file: FileInfo) => {
@@ -876,8 +952,8 @@ function App() {
                     ) : (
                       <>
                         <PlusOutlined style={{ fontSize: 28, color: textSecondary, marginBottom: 8 }} />
-                        <div style={{ color: textSecondary, fontSize: 13 }}>上传文件</div>
-                        <div style={{ color: textSecondary, fontSize: 11, marginTop: 2 }}>点击或拖拽 · HTML 或 ZIP</div>
+                        <div style={{ color: textSecondary, fontSize: 13 }}>上传新项目</div>
+                        <div style={{ color: textSecondary, fontSize: 11, marginTop: 2 }}>点击或拖拽 HTML 或 ZIP 文件到此区域即可创建新项目</div>
                       </>
                     )}
                   </div>
@@ -941,6 +1017,18 @@ function App() {
                                 {file.title}
                               </span>
                             </Tooltip>
+                            {file.currentVersion && (
+                              <span style={{
+                                fontSize: 11,
+                                color: textSecondary,
+                                background: currentTheme === 'dark' ? 'rgba(255,255,255,0.1)' : '#f1f3f4',
+                                padding: '2px 6px',
+                                borderRadius: 4,
+                                flexShrink: 0,
+                              }}>
+                                {file.currentVersion}
+                              </span>
+                            )}
                             {file.hasPassword && (
                               <Tooltip title={file.canDelete ? '已加密，点击修改' : '已加密'}>
                                 <Button
@@ -963,6 +1051,34 @@ function App() {
                                 />
                               </Tooltip>
                             )}
+                            {file.canDelete && (
+                              <Tooltip title="上传新版本">
+                                <Button
+                                  size="small"
+                                  type="text"
+                                  icon={<PlusOutlined />}
+                                  onClick={(e) => { e.stopPropagation(); document.getElementById(`version-upload-${file.key.replace(/[^a-zA-Z0-9]/g, '_')}`)?.click(); }}
+                                  style={{ color: textSecondary, flexShrink: 0 }}
+                                />
+                              </Tooltip>
+                            )}
+                            <input
+                              id={`version-upload-${file.key.replace(/[^a-zA-Z0-9]/g, '_')}`}
+                              type="file"
+                              accept=".html,.HTML"
+                              style={{ display: 'none' }}
+                              onChange={(e) => {
+                                const f = e.target.files?.[0];
+                                if (f) {
+                                  if (!file.canDelete) {
+                                    message.error(`${file.title}：暂无编辑权限`);
+                                  } else {
+                                    handleUploadNewVersion(f);
+                                  }
+                                }
+                                e.target.value = '';
+                              }}
+                            />
                             {file.canDelete && (
                               <Button
                                 size="small"
@@ -1008,6 +1124,16 @@ function App() {
                                 onClick={(e) => { e.stopPropagation(); copyToClipboard(fullUrl); }}
                                 style={{ flexShrink: 0 }}
                               />
+                            </Tooltip>
+                            <Tooltip title="版本历史">
+                              <Button
+                                size="small"
+                                type="text"
+                                onClick={(e) => { e.stopPropagation(); handleShowVersions(file); }}
+                                style={{ color: textSecondary, flexShrink: 0 }}
+                              >
+                                版本历史
+                              </Button>
                             </Tooltip>
                             {file.canDelete && (
                               <Popconfirm
@@ -1276,6 +1402,113 @@ function App() {
               </div>
             </>
           )}
+        </div>
+      </Modal>
+
+      {/* Version History Modal */}
+      <Modal
+        title={`版本历史 — ${versionFile?.title || ''}`}
+        open={versionModalVisible}
+        onCancel={() => setVersionModalVisible(false)}
+        footer={null}
+        width={500}
+      >
+        <div style={{ marginTop: 16 }}>
+          {/* Upload new version */}
+          <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={() => document.getElementById('version-file-input')?.click()}
+            >
+              上传新版本
+            </Button>
+            <input
+              id="version-file-input"
+              key={versionFileInputKey}
+              type="file"
+              accept=".html,.HTML"
+              style={{ display: 'none' }}
+              onChange={handleVersionFileInputChange}
+            />
+            <span style={{ color: textSecondary, fontSize: 12 }}>支持 HTML 文件</span>
+          </div>
+
+          {/* Version list */}
+          <div>
+            {Object.entries(versionList)
+              .sort(([a], [b]) => {
+                const numA = parseInt(a.replace('V', '')) || 0;
+                const numB = parseInt(b.replace('V', '')) || 0;
+                return numB - numA;
+              })
+              .map(([version, info]) => {
+                const isCurrent = version === currentVersion;
+                const uploadDate = new Date(info.upload_time);
+                const dateStr = `${uploadDate.getMonth() + 1}月${uploadDate.getDate()}日 ${String(uploadDate.getHours()).padStart(2, '0')}:${String(uploadDate.getMinutes()).padStart(2, '0')}`;
+                return (
+                  <div
+                    key={version}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      padding: '12px 0',
+                      borderBottom: `1px solid ${borderColor}`,
+                      gap: 8,
+                    }}
+                  >
+                    <span style={{
+                      width: 8,
+                      height: 8,
+                      borderRadius: '50%',
+                      background: isCurrent ? '#52c41a' : 'transparent',
+                      border: `2px solid ${isCurrent ? '#52c41a' : '#d9d9d9'}`,
+                      flexShrink: 0,
+                    }} />
+                    <span style={{
+                      fontWeight: isCurrent ? 600 : 400,
+                      color: isCurrent ? '#52c41a' : textColor,
+                      minWidth: 40,
+                    }}>
+                      {version}
+                    </span>
+                    {isCurrent && (
+                      <span style={{ fontSize: 11, color: '#52c41a', background: '#f6ffed', padding: '1px 6px', borderRadius: 4, border: '1px solid #b7eb8f' }}>
+                        当前
+                      </span>
+                    )}
+                    <span style={{ flex: 1, fontSize: 12, color: textSecondary }}>
+                      {dateStr} {info.uploader_ip && `· ${info.uploader_ip}`}
+                    </span>
+                    <Button size="small" onClick={() => window.open(`/versions/${versionFile?.path}/${version}`, '_blank')}>
+                      预览
+                    </Button>
+                    {!isCurrent && (
+                      <Button size="small" onClick={() => handleRestoreVersion(version)}>
+                        恢复此版本
+                      </Button>
+                    )}
+                    {!isCurrent && versionFile?.canDelete && (
+                      <Popconfirm
+                        title="确认删除"
+                        description={`删除 ${version} 版本？`}
+                        onConfirm={() => handleDeleteVersion(version)}
+                        okText="删除"
+                        cancelText="取消"
+                        okButtonProps={{ danger: true }}
+                      >
+                        <Button size="small" danger>删除</Button>
+                      </Popconfirm>
+                    )}
+                  </div>
+                );
+              })}
+            {Object.keys(versionList).length === 0 && (
+              <div style={{ textAlign: 'center', padding: '40px 0', color: textSecondary }}>
+                暂无版本记录
+              </div>
+            )}
+          </div>
         </div>
       </Modal>
 

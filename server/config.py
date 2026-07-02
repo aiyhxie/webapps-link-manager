@@ -17,6 +17,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).parent.parent.resolve()
 SERVER_DIR = Path(__file__).parent.resolve()
 WEBAPPS_DIR = BASE_DIR / "webapps"
+VERSIONS_DIR = BASE_DIR / "versions"  # Historical version files storage
 METADATA_FILE = BASE_DIR / "metadata.json"
 ITERATION_FILE = BASE_DIR / "version_iteration.json"
 
@@ -52,3 +53,4 @@ VERSION = get_version()
 
 # Ensure webapps directory exists
 WEBAPPS_DIR.mkdir(parents=True, exist_ok=True)
+VERSIONS_DIR.mkdir(parents=True, exist_ok=True)

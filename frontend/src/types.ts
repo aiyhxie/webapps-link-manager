@@ -24,6 +24,19 @@ export interface FileInfo {
   canDelete: boolean;    // 当前用户是否有权删除
   productLine?: string;  // 产品线分类
   hasPassword?: boolean; // 是否有密码保护
+  currentVersion?: string; // 当前版本号，如 "V3"
+}
+
+// 版本信息
+export interface VersionInfo {
+  upload_time: string;
+  uploader_ip: string;
+}
+
+// 版本列表响应
+export interface VersionsResponse {
+  current_version: string;
+  versions: Record<string, VersionInfo>;
 }
 
 // API 统一响应格式

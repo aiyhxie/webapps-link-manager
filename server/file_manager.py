@@ -3,10 +3,14 @@ File management for WebApps Link Manager.
 
 功能说明：
 - scan_webapps(): 扫描 webapps/ 目录下所有 HTML 文件，生成项目列表
-- upload_file(): 保存上传的 HTML 文件到 webapps/ 目录
+- upload_file(): 保存上传的 HTML 文件到 webapps/ 目录（支持版本管理）
 - extract_zip(): 解压 ZIP 文件到 webapps/ 子目录，支持 UTF-8/GBK/CP437 编码
 - delete_file(): 删除文件（需校验上传者 IP）
 - can_delete(): 检查用户是否有权限删除文件
+
+版本管理：
+- 上传同名文件时：旧内容存档到 versions/ 目录，新内容写入原路径
+- 版本访问：通过 /versions/<filename>/<version> 访问历史版本
 
 文件 Key 规则：
 - 根目录文件：file:example.html
@@ -29,7 +33,7 @@ from typing import List, Dict, Any, Optional, Tuple
 _server_dir = Path(__file__).parent.resolve()
 sys.path.insert(0, str(_server_dir))
 
-from config import WEBAPPS_DIR
+from config import WEBAPPS_DIR, VERSIONS_DIR
 import metadata
 
 
@@ -255,6 +259,8 @@ def scan_webapps() -> List[Dict[str, Any]]:
                     product_line = ""
 
             has_password = bool(meta.get("password"))
+            versions_info = metadata.get_versions(key)
+            current_version = versions_info.get("current_version", "V1")
             files.append({
                 "key": key,
                 "path": item.name,
@@ -266,6 +272,7 @@ def scan_webapps() -> List[Dict[str, Any]]:
                 "url": f"/protected/{item.name}" if has_password else f"/files/{item.name}",
                 "productLine": product_line,
                 "hasPassword": has_password,
+                "currentVersion": current_version,
             })
 
         elif item.is_dir():
@@ -311,6 +318,8 @@ def scan_webapps() -> List[Dict[str, Any]]:
                         pass
 
                 has_password = bool(meta.get("password"))
+                versions_info = metadata.get_versions(key)
+                current_version = versions_info.get("current_version", "V1")
                 files.append({
                     "key": key,
                     "path": rel_path.as_posix(),
@@ -322,6 +331,7 @@ def scan_webapps() -> List[Dict[str, Any]]:
                     "url": f"/protected/{rel_path.as_posix()}" if has_password else f"/files/{rel_path.as_posix()}",
                     "productLine": product_line,
                     "hasPassword": has_password,
+                    "currentVersion": current_version,
                 })
 
     return sorted(files, key=lambda x: x["path"])
@@ -330,6 +340,8 @@ def scan_webapps() -> List[Dict[str, Any]]:
 def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool, str, str]:
     """
     Save an uploaded HTML file to webapps directory.
+    If the file already exists, archive the old content as a new version and
+    save the new content to the original path.
     Returns (success, message, key)
     """
     if not filename.lower().endswith(".html"):
@@ -339,14 +351,22 @@ def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool
         # Handle filename to prevent path traversal
         safe_filename = os.path.basename(filename)
         dest_path = WEBAPPS_DIR / safe_filename
+        key = f"file:{safe_filename}"
 
-        # If file exists, add timestamp suffix
+        # Check if file already exists (new version scenario)
         if dest_path.exists():
-            name, ext = os.path.splitext(safe_filename)
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            safe_filename = f"{name}_{timestamp}{ext}"
-            dest_path = WEBAPPS_DIR / safe_filename
+            # Archive old content as previous version
+            old_content = dest_path.read_bytes()
+            old_meta = metadata.get_file_meta(key)
+            prev_version = old_meta.get("current_version", "V1") if old_meta else "V1"
+            # Save old content to versions directory with version suffix
+            version_filename = f"{safe_filename}__{prev_version}"
+            version_path = VERSIONS_DIR / version_filename
+            version_path.write_bytes(old_content)
+            # Add new version to metadata
+            metadata.add_version(key, uploader_ip)
 
+        # Write new content to original path
         dest_path.write_bytes(file_data)
         rel_path = dest_path.relative_to(WEBAPPS_DIR)
         key = f"file:{rel_path.as_posix()}"
@@ -361,16 +381,31 @@ def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool
         # Auto-detect product line from title and description
         product_line = detect_product_line(title, description)
 
-        # Save metadata
-        metadata.set_file_meta(
-            key=key,
-            title=title,
-            uploader_ip=uploader_ip,
-            description=description,
-            original_name=filename,
-            product_line=product_line,
-        )
+        # Check if metadata already exists (new version vs new file)
+        existing_meta = metadata.get_file_meta(key)
+        if existing_meta:
+            # Update existing metadata with new upload time
+            meta = metadata.load_metadata()
+            meta[key]["upload_time"] = datetime.now().isoformat()
+            meta[key]["uploader_ip"] = uploader_ip
+            # Preserve password and other settings
+            metadata.save_metadata(meta)
+        else:
+            # Save new metadata
+            metadata.set_file_meta(
+                key=key,
+                title=title,
+                uploader_ip=uploader_ip,
+                description=description,
+                original_name=filename,
+                product_line=product_line,
+            )
 
+        # Get current version number for success message
+        versions_info = metadata.get_versions(key)
+        current_v = versions_info.get("current_version", "V1")
+        if dest_path.exists() and existing_meta:
+            return True, f"已更新为 {current_v} 版本", key
         return True, f"已上传 {safe_filename}", key
     except Exception as e:
         return False, f"上传失败: {str(e)}", ""
@@ -616,8 +651,114 @@ def delete_file(key: str, request_ip: str) -> Tuple[bool, str]:
 
 
 def can_delete(key: str, request_ip: str) -> bool:
-    """Check if a user can delete a file based on IP."""
+    """Check if a user can delete a file based on IP. Empty uploader_ip means file was set up by admin."""
     meta = metadata.get_file_meta(key)
     if not meta:
         return False
-    return meta.get("uploader_ip") == request_ip
+    stored_ip = meta.get("uploader_ip", "")
+    # Empty uploader_ip means no IP restriction (admin-managed file)
+    if not stored_ip:
+        return True
+    return stored_ip == request_ip
+
+
+# ── Historical Version File Management ────────────────────────────────────────
+
+def get_version_content(filename: str, version: str) -> Optional[bytes]:
+    """
+    Get the content of a historical version file.
+    Returns bytes if found, None if not found.
+    """
+    # Try exact match first
+    version_filename = f"{filename}__{version}"
+    version_path = VERSIONS_DIR / version_filename
+    if version_path.exists():
+        return version_path.read_bytes()
+
+    # Try case-insensitive match
+    for vf in VERSIONS_DIR.iterdir():
+        if vf.name.startswith(filename) and vf.name.endswith(f"__{version}"):
+            return vf.read_bytes()
+
+    return None
+
+
+def get_current_content(filename: str) -> Optional[bytes]:
+    """Get the content of the current (latest) version of a file."""
+    file_path = WEBAPPS_DIR / filename
+    if file_path.exists():
+        return file_path.read_bytes()
+    return None
+
+
+def restore_version_file(key: str, version: str, request_ip: str) -> Tuple[bool, str]:
+    """
+    Restore a historical version as the current version.
+    Returns (success, message).
+    """
+    # Check permission
+    if not can_delete(key, request_ip):
+        return False, "无权恢复此版本"
+
+    # Get filename from key
+    filename = key[5:] if key.startswith("file:") else key
+
+    # Get historical version content
+    content = get_version_content(filename, version)
+
+    # Archive current content as the previous version
+    current_meta = metadata.get_file_meta(key)
+    if current_meta:
+        current_content = get_current_content(filename)
+        if current_content:
+            current_v = current_meta.get("current_version", "V1")
+            version_filename = f"{filename}__{current_v}"
+            version_path = VERSIONS_DIR / version_filename
+            version_path.write_bytes(current_content)
+        # Update metadata
+        ok, msg = metadata.restore_version(key, version)
+        if not ok:
+            return False, msg
+
+    # If historical version has physical file, write it to current path
+    if content is not None:
+        file_path = WEBAPPS_DIR / filename
+        file_path.write_bytes(content)
+
+    return True, f"已恢复为 {version} 版本"
+
+
+def delete_version_file(key: str, version: str, request_ip: str) -> Tuple[bool, str]:
+    """
+    Delete a historical version file.
+    Returns (success, message).
+    """
+    # Check permission
+    if not can_delete(key, request_ip):
+        return False, "无权删除此版本"
+
+    # Get filename from key
+    filename = key[5:] if key.startswith("file:") else key
+
+    # Find and delete the version file
+    version_filename = f"{filename}__{version}"
+    version_path = VERSIONS_DIR / version_filename
+
+    # Try case-insensitive match
+    if not version_path.exists():
+        for vf in VERSIONS_DIR.iterdir():
+            if vf.name.startswith(filename) and vf.name.endswith(f"__{version}"):
+                version_path = vf
+                break
+
+    if not version_path.exists():
+        # No physical file, but remove from metadata
+        return metadata.delete_version(key, version)
+
+    try:
+        version_path.unlink()
+    except Exception as e:
+        return False, f"删除版本文件失败: {str(e)}"
+
+    # Remove from metadata
+    return metadata.delete_version(key, version)

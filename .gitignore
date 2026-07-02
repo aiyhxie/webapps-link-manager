@@ -9,6 +9,7 @@ __pycache__/
 
 # User data (exclude uploaded files and runtime data)
 webapps/
+versions/
 logs/
 metadata.json
 version_iteration.json
