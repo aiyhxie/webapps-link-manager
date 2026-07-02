@@ -251,14 +251,52 @@ cd server && python3 app.py
 
 ---
 
-## 5. 版本信息
+## 5. 开发规范
+
+### 5.1 代码提交流程
+
+1. **开发自测**：每次代码修改后，必须对**所有受影响的功能**进行全面测试
+2. **测试清单**：针对每个改动，列出可能影响的功能点，逐项验证
+3. **回归测试**：确保新改动不破坏已有功能
+4. **复测确认**：发现 Bug → 修复 → 再次完整测试 → 确认通过后再交付
+
+### 5.2 受影响功能快速检测清单
+
+| 改动范围 | 必须测试的功能点 |
+|---------|----------------|
+| 后端 API 改动 | API 响应格式、错误处理、权限校验、Cookie 设置 |
+| 前端认证流程 | 登录/登出、会话保持、Token 管理 |
+| 文件访问改动 | 无密码访问、有密码访问、会话复用、错误密码拒绝 |
+| 文件上传改动 | HTML 上传、ZIP 上传、文件列表刷新、重复上传 |
+| 管理功能改动 | 管理员登录、添加/删除用户、修改密码、日志查看 |
+
+### 5.3 API 测试命令参考
+
+```bash
+# 基础测试
+curl -s http://localhost:8080/api/status
+curl -s http://localhost:8080/api/files
+curl -s http://localhost:8080/api/admin/status
+
+# 文件访问测试
+curl -s "http://localhost:8080/api/files/<key>/session"
+curl -s "http://localhost:8080/api/files/<key>/password" -X POST -H "Content-Type: application/json" -d '{"password":"xxx"}'
+curl -s -b cookies.txt "http://localhost:8080/protected/<filename>"
+
+# 认证流程测试
+curl -s "http://localhost:8080/api/admin/login" -X POST -H "Content-Type: application/json" -d '{"username":"xxx","password":"xxx"}'
+```
+
+---
+
+## 6. 版本信息
 
 - 当前版本：参见 config.py 中的 VERSION
 - 版本号格式：主版本.迭代号 (如 1.0.1)
 
 ---
 
-## 6. 附录
+## 7. 附录
 
 ### 6.1 IP 获取说明
 
