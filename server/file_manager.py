@@ -608,6 +608,100 @@ def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]
         return False, f"解压失败: {str(e)}", []
 
 
+def extract_zip_for_version(zip_data: bytes, target_filename: str, uploader_ip: str) -> Tuple[bool, str, str]:
+    """
+    Extract a ZIP file to webapps directory and update the target file as a new version.
+    Archives the current content before overwriting.
+    Returns (success, message, key)
+    """
+    import io
+    import struct
+
+    def try_decode(bytes_data: bytes) -> str:
+        for enc in ['utf-8', 'gbk', 'cp437', 'latin-1']:
+            try:
+                return bytes_data.decode(enc)
+            except:
+                continue
+        return bytes_data.decode('latin-1', errors='replace')
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+            all_names = zf.namelist()
+            all_names = [n for n in all_names if not n.endswith('/')]
+
+            if not all_names:
+                return False, "ZIP 包内没有文件", ""
+
+            # Try to find index.html or the first .html file
+            main_entry = None
+            for name in all_names:
+                if name.lower() == 'index.html':
+                    main_entry = name
+                    break
+            if not main_entry:
+                for name in all_names:
+                    if name.lower().endswith('.html'):
+                        main_entry = name
+                        break
+
+            if not main_entry:
+                return False, "未找到 index.html 文件", ""
+
+            # Read the main HTML content
+            main_content = zf.read(main_entry)
+            title, description = extract_html_description(main_content)
+
+            # Get target key
+            key = f"file:{target_filename}"
+
+            # Archive current content if exists
+            current_path = WEBAPPS_DIR / target_filename
+            if current_path.exists():
+                old_content = current_path.read_bytes()
+                old_meta = metadata.get_file_meta(key)
+                prev_version = old_meta.get("current_version", "V1") if old_meta else "V1"
+                version_filename = f"{target_filename}__{prev_version}"
+                version_path = VERSIONS_DIR / version_filename
+                version_path.write_bytes(old_content)
+                # Add new version
+                metadata.add_version(key, uploader_ip)
+
+            # Write new content to target path
+            current_path.write_bytes(main_content)
+
+            # Update metadata
+            existing_meta = metadata.get_file_meta(key)
+            if existing_meta:
+                meta = metadata.load_metadata()
+                meta[key]["upload_time"] = datetime.now().isoformat()
+                meta[key]["uploader_ip"] = uploader_ip
+                if not meta[key].get("title") or title:
+                    meta[key]["title"] = title or target_filename
+                if not meta[key].get("description"):
+                    meta[key]["description"] = description or ""
+                metadata.save_metadata(meta)
+            else:
+                product_line = detect_product_line(title or target_filename, description or "")
+                metadata.set_file_meta(
+                    key=key,
+                    title=title or target_filename,
+                    uploader_ip=uploader_ip,
+                    description=description or "",
+                    original_name=target_filename,
+                    product_line=product_line,
+                )
+
+            versions_info = metadata.get_versions(key)
+            current_v = versions_info.get("current_version", "V1")
+            return True, f"已更新为 {current_v} 版本", key
+
+    except zipfile.BadZipFile:
+        return False, "无效的 ZIP 文件", ""
+    except Exception as e:
+        return False, f"解压失败: {str(e)}", ""
+
+
 def delete_file(key: str, request_ip: str) -> Tuple[bool, str]:
     """
     Delete a file if the request IP matches the uploader IP.

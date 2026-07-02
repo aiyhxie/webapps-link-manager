@@ -73,7 +73,6 @@ function App() {
   const [versionFile, setVersionFile] = useState<FileInfo | null>(null);
   const [versionList, setVersionList] = useState<Record<string, { upload_time: string; uploader_ip: string }>>({});
   const [currentVersion, setCurrentVersion] = useState('');
-  const [versionFileInputKey, setVersionFileInputKey] = useState(0);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     const saved = localStorage.getItem('themeMode');
     return (saved as ThemeMode) || 'auto';
@@ -85,6 +84,7 @@ function App() {
   });
 
   const [isDragging, setIsDragging] = useState(false);
+  const [draggingOverKey, setDraggingOverKey] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Admin state
@@ -453,7 +453,6 @@ function App() {
         setVersionList(vr.data.versions || {});
         setCurrentVersion(vr.data.current_version || 'V1');
       }
-      setVersionFileInputKey(k => k + 1);
     } else {
       message.error(result.message || '版本更新失败');
     }
@@ -493,13 +492,6 @@ function App() {
     }
   };
 
-  const handleVersionFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (files && files.length > 0) {
-      handleUploadNewVersion(files[0]);
-    }
-    e.target.value = '';
-  };
 
   const handleCardClick = (file: FileInfo) => {
     // Always open directly - password check happens on the file page itself
@@ -960,17 +952,42 @@ function App() {
 
                   {filteredFiles.map(file => {
                     const fullUrl = `${baseUrl}${file.url}`;
+                    const isDragOver = draggingOverKey === file.key;
                     return (
                       <Card
                         key={file.key}
                         hoverable
                         onClick={() => handleCardClick(file)}
+                        onDragOver={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setDraggingOverKey(file.key);
+                        }}
+                        onDragLeave={(e) => {
+                          e.stopPropagation();
+                          if (draggingOverKey === file.key) setDraggingOverKey(null);
+                        }}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setDraggingOverKey(null);
+                          const files = e.dataTransfer.files;
+                          if (files && files.length > 0) {
+                            const f = files[0];
+                            if (!file.canDelete) {
+                              message.error(`${file.title}：暂无编辑权限`);
+                            } else {
+                              handleUploadNewVersion(f);
+                            }
+                          }
+                        }}
                         className="file-card"
                         style={{
                           background: cardBg,
-                          border: `1px solid ${borderColor}`,
+                          border: `1px solid ${isDragOver ? (currentTheme === 'dark' ? '#8ab4f8' : '#4285f4') : borderColor}`,
                           borderRadius: 12,
                           cursor: 'pointer',
+                          position: 'relative',
                         }}
                         bodyStyle={{ padding: 0, display: 'flex', flexDirection: 'column', height: '100%' }}
                       >
@@ -1070,7 +1087,7 @@ function App() {
                             <input
                               id={`version-upload-${file.key.replace(/[^a-zA-Z0-9]/g, '_')}`}
                               type="file"
-                              accept=".html,.HTML"
+                              accept=".html,.HTML,.zip,.ZIP"
                               style={{ display: 'none' }}
                               onChange={(e) => {
                                 const f = e.target.files?.[0];
@@ -1095,6 +1112,29 @@ function App() {
                             )}
                           </div>
                         </div>
+
+                        {/* Drag overlay for version update */}
+                        {isDragOver && (
+                          <div
+                            style={{
+                              position: 'absolute',
+                              inset: 0,
+                              background: currentTheme === 'dark' ? 'rgba(138,180,248,0.3)' : 'rgba(66,133,244,0.15)',
+                              borderRadius: 12,
+                              display: 'flex',
+                              flexDirection: 'column',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              zIndex: 10,
+                              pointerEvents: 'none',
+                            }}
+                          >
+                            <InboxOutlined style={{ fontSize: 28, color: currentTheme === 'dark' ? '#8ab4f8' : '#4285f4' }} />
+                            <div style={{ color: currentTheme === 'dark' ? '#8ab4f8' : '#4285f4', fontSize: 13, marginTop: 8 }}>
+                              释放以更新版本
+                            </div>
+                          </div>
+                        )}
 
                         {/* Card Body */}
                         <div style={{ padding: '12px 16px' }}>
@@ -1409,36 +1449,16 @@ function App() {
         width={500}
       >
         <div style={{ marginTop: 16 }}>
-          {/* Upload new version */}
-          <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Button
-              type="primary"
-              icon={<PlusOutlined />}
-              onClick={() => document.getElementById('version-file-input')?.click()}
-            >
-              上传新版本
-            </Button>
-            <input
-              id="version-file-input"
-              key={versionFileInputKey}
-              type="file"
-              accept=".html,.HTML"
-              style={{ display: 'none' }}
-              onChange={handleVersionFileInputChange}
-            />
-            <span style={{ color: textSecondary, fontSize: 12 }}>支持 HTML 文件</span>
-          </div>
-
-          {/* Version list */}
+          {/* Version list - exclude current version */}
           <div>
             {Object.entries(versionList)
+              .filter(([version]) => version !== currentVersion)
               .sort(([a], [b]) => {
                 const numA = parseInt(a.replace('V', '')) || 0;
                 const numB = parseInt(b.replace('V', '')) || 0;
                 return numB - numA;
               })
               .map(([version, info]) => {
-                const isCurrent = version === currentVersion;
                 const uploadDate = new Date(info.upload_time);
                 const dateStr = `${uploadDate.getMonth() + 1}月${uploadDate.getDate()}日 ${String(uploadDate.getHours()).padStart(2, '0')}:${String(uploadDate.getMinutes()).padStart(2, '0')}`;
                 return (
@@ -1456,34 +1476,26 @@ function App() {
                       width: 8,
                       height: 8,
                       borderRadius: '50%',
-                      background: isCurrent ? '#52c41a' : 'transparent',
-                      border: `2px solid ${isCurrent ? '#52c41a' : '#d9d9d9'}`,
+                      border: `2px solid #d9d9d9`,
                       flexShrink: 0,
                     }} />
                     <span style={{
-                      fontWeight: isCurrent ? 600 : 400,
-                      color: isCurrent ? '#52c41a' : textColor,
+                      fontWeight: 400,
+                      color: textColor,
                       minWidth: 40,
                     }}>
                       {version}
                     </span>
-                    {isCurrent && (
-                      <span style={{ fontSize: 11, color: '#52c41a', background: '#f6ffed', padding: '1px 6px', borderRadius: 4, border: '1px solid #b7eb8f' }}>
-                        当前
-                      </span>
-                    )}
                     <span style={{ flex: 1, fontSize: 12, color: textSecondary }}>
                       {dateStr} {info.uploader_ip && `· ${info.uploader_ip}`}
                     </span>
                     <Button size="small" onClick={() => window.open(`/versions/${versionFile?.path}/${version}`, '_blank')}>
                       预览
                     </Button>
-                    {!isCurrent && (
-                      <Button size="small" onClick={() => handleRestoreVersion(version)}>
+                    <Button size="small" onClick={() => handleRestoreVersion(version)}>
                         恢复此版本
-                      </Button>
-                    )}
-                    {!isCurrent && versionFile?.canDelete && (
+                    </Button>
+                    {versionFile?.canDelete && (
                       <Popconfirm
                         title="确认删除"
                         description={`删除 ${version} 版本？`}
@@ -1498,9 +1510,9 @@ function App() {
                   </div>
                 );
               })}
-            {Object.keys(versionList).length === 0 && (
+            {Object.keys(versionList).filter(v => v !== currentVersion).length === 0 && (
               <div style={{ textAlign: 'center', padding: '40px 0', color: textSecondary }}>
-                暂无版本记录
+                暂无历史版本
               </div>
             )}
           </div>

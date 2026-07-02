@@ -425,15 +425,22 @@ def create_app():
 
         original_filename = file.filename
         original_lower = original_filename.lower()
-
-        if not original_lower.endswith(".html"):
-            return jsonify({"success": False, "message": "只支持 HTML 文件"}), 400
-
         file_data = file.read()
         filename = key[5:] if key.startswith("file:") else key
 
-        # Use upload_file which handles version archiving
-        success, message, returned_key = file_manager.upload_file(file_data, filename, client_ip)
+        if original_lower.endswith(".zip"):
+            # Handle ZIP: extract and use the main HTML content
+            success, msg, keys = file_manager.extract_zip_for_version(file_data, filename, client_ip)
+            if success:
+                versions_info = metadata.get_versions(key)
+                current_v = versions_info.get("current_version", "V1")
+                log_file_action("上传新版本ZIP", f"{key} -> {current_v}")
+                return jsonify({"success": True, "message": msg, "version": current_v})
+            else:
+                return jsonify({"success": False, "message": msg}), 400
+        elif original_lower.endswith(".html"):
+            # Handle HTML: archive old content and save new
+            success, message, returned_key = file_manager.upload_file(file_data, filename, client_ip)
         if success:
             # Get current version
             versions_info = metadata.get_versions(key)
