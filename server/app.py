@@ -79,6 +79,27 @@ _access_tokens: Dict[str, Dict] = {}
 # In-memory admin session store: token -> username
 _admin_sessions: Dict[str, str] = {}
 
+# One-time short-lived log viewer tokens: token -> expiry timestamp
+_log_viewer_tokens: Dict[str, float] = {}
+
+
+def _make_log_token() -> str:
+    """Generate a short-lived one-time log viewer token (5 minutes)."""
+    import time
+    token = secrets.token_urlsafe(24)
+    _log_viewer_tokens[token] = time.time() + 300  # 5 minutes
+    return token
+
+
+def _check_log_token(token: str) -> bool:
+    """Check if a log token is valid and not expired. Consumes it immediately (one-time use)."""
+    import time
+    if token not in _log_viewer_tokens:
+        return False
+    if time.time() > _log_viewer_tokens.pop(token):
+        return False
+    return True
+
 
 def _safe_cookie_name(filename: str) -> str:
     """Generate a safe cookie name from filename - replaces / with _ to avoid cookie parsing issues."""
@@ -579,12 +600,27 @@ def create_app():
 
     # ── Log Viewing ──────────────────────────────────────────────────────────────
 
+    @app.route("/api/logs/token", methods=["GET"])
+    def create_log_token():
+        """Generate a one-time log viewer token. Requires valid admin session."""
+        admin_token = request.headers.get("X-Admin-Token", "")
+        if not admin_token or admin_token not in _admin_sessions:
+            return jsonify({"success": False, "message": "未登录"}), 401
+        new_log_tok = _make_log_token()
+        return jsonify({"success": True, "token": new_log_tok})
+
     @app.route("/api/logs", methods=["GET"])
     def get_logs():
         """Get recent log entries (admin only)."""
-        # Support token from query param or header
-        token = request.args.get("token", "") or request.headers.get("X-Admin-Token", "")
-        if not token or token not in _admin_sessions:
+        # Accept one-time log viewer token (consumes it) OR admin session token
+        log_token = request.args.get("log_token", "")
+        admin_token = request.headers.get("X-Admin-Token", "")
+        # One-time log token takes priority
+        if log_token and _check_log_token(log_token):
+            pass  # valid, one-time token consumed
+        elif admin_token and admin_token in _admin_sessions:
+            pass  # valid admin session
+        else:
             return jsonify({"success": False, "message": "未登录"}), 401
 
         try:
@@ -601,9 +637,15 @@ def create_app():
     @app.route("/logs", methods=["GET"])
     def view_logs():
         """Serve log viewer page (admin only)."""
-        # Check token from query param (for new tab access) or from session header
-        token = request.args.get("token", "") or request.headers.get("X-Admin-Token", "")
-        if not token or token not in _admin_sessions:
+        # Accept one-time log viewer token
+        log_token = request.args.get("log_token", "")
+        admin_token = request.headers.get("X-Admin-Token", "")
+
+        if log_token and _check_log_token(log_token):
+            pass  # valid one-time token consumed
+        elif admin_token and admin_token in _admin_sessions:
+            pass  # valid admin session
+        else:
             return "<html><body style='font-family: sans-serif; text-align: center; padding: 60px;'><h1>请先登录管理员账号</h1><p>当前会话已过期或未登录</p><p><a href='/'>返回首页</a></p></body></html>", 401
 
         return """
@@ -651,17 +693,30 @@ def create_app():
             </div>
             <script>
                 let allLogs = [];
+                let _adminTok = new URLSearchParams(window.location.search).get('admin_token') || '';
 
                 async function loadLogs() {
                     try {
-                        const token = new URLSearchParams(window.location.search).get('token') || '';
-                        const resp = await fetch('/api/logs' + (token ? '?token=' + encodeURIComponent(token) : ''), {
-                            headers: token ? { 'X-Admin-Token': token } : {}
-                        });
+                        const logTok = new URLSearchParams(window.location.search).get('log_token') || '';
+                        const adminTok = new URLSearchParams(window.location.search).get('admin_token') || '';
+                        let url = '/api/logs?log_token=' + encodeURIComponent(logTok);
+                        if (!logTok && adminTok) {
+                            // Need a fresh one-time log token - get it first
+                            const tokResp = await fetch('/api/logs/token', { headers: { 'X-Admin-Token': adminTok } });
+                            const tokData = await tokResp.json();
+                            if (!tokData.success || !tokData.token) {
+                                document.getElementById('logContainer').innerHTML = '<div class="empty">会话过期，请刷新页面重试</div>';
+                                return;
+                            }
+                            url = '/api/logs?log_token=' + encodeURIComponent(tokData.token);
+                        }
+                        const resp = await fetch(url);
                         const data = await resp.json();
                         if (data.success && data.logs) {
                             allLogs = data.logs;
                             renderLogs(allLogs);
+                        } else if (data.message) {
+                            document.getElementById('logContainer').innerHTML = '<div class="empty">' + data.message + '</div>';
                         }
                     } catch(e) {
                         document.getElementById('logContainer').innerHTML = '<div class="empty">加载失败: ' + e.message + '</div>';
@@ -713,7 +768,7 @@ def create_app():
 
                 // Load on init
                 loadLogs();
-                // Auto refresh every 10 seconds
+                // Auto refresh every 10 seconds using stored admin token
                 setInterval(loadLogs, 10000);
             </script>
         </body>
