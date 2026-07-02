@@ -69,9 +69,6 @@ function App() {
   const [drawerVisible, setDrawerVisible] = useState(false);
   const [passwordModalVisible, setPasswordModalVisible] = useState(false);
   const [passwordFile, setPasswordFile] = useState<FileInfo | null>(null);
-  const [accessModalVisible, setAccessModalVisible] = useState(false);
-  const [accessFile, setAccessFile] = useState<FileInfo | null>(null);
-  const [accessPassword, setAccessPassword] = useState('');
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     const saved = localStorage.getItem('themeMode');
     return (saved as ThemeMode) || 'auto';
@@ -429,37 +426,8 @@ function App() {
   };
 
   const handleCardClick = (file: FileInfo) => {
-    if (file.hasPassword) {
-      // Check if session is already authenticated before showing password modal
-      api.checkFileSession(file.key).then(result => {
-        if (result.success && result.hasAccess) {
-          // Session authenticated - open directly
-          window.open(file.url, '_blank');
-        } else {
-          // Not authenticated - show password modal
-          setAccessFile(file);
-          setAccessPassword('');
-          setAccessModalVisible(true);
-        }
-      });
-    } else {
-      window.open(file.url, '_blank');
-    }
-  };
-
-  const handleAccessSubmit = async () => {
-    if (!accessFile) return;
-    const result = await api.checkPassword(accessFile.key, accessPassword);
-    if (result.success) {
-      // Token is stored in HttpOnly cookie by the server
-      // Just close modal and open the file - browser will send cookie automatically
-      setAccessModalVisible(false);
-      setTimeout(() => {
-        window.open(accessFile.url, '_blank');
-      }, 100);
-    } else {
-      message.error(result.message || '密码错误');
-    }
+    // Always open directly - password check happens on the file page itself
+    window.open(file.url, '_blank');
   };
 
   const copyToClipboard = (text: string) => {
@@ -1308,25 +1276,6 @@ function App() {
               </div>
             </>
           )}
-        </div>
-      </Modal>
-
-      <Modal
-        title="请输入访问密码"
-        open={accessModalVisible}
-        onCancel={() => setAccessModalVisible(false)}
-        footer={[
-          <Button key="cancel" onClick={() => setAccessModalVisible(false)}>取消</Button>,
-          <Button key="submit" type="primary" onClick={handleAccessSubmit}>确认</Button>
-        ]}
-      >
-        <div style={{ marginTop: 16 }}>
-          <Input.Password
-            placeholder="请输入密码"
-            value={accessPassword}
-            onChange={(e) => setAccessPassword(e.target.value)}
-            onPressEnter={handleAccessSubmit}
-          />
         </div>
       </Modal>
 
