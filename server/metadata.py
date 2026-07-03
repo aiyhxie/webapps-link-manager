@@ -35,9 +35,11 @@ metadata.json 格式：
 """
 import json
 import sys
+import hashlib
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
+import bcrypt
 
 # Add server directory to path for imports
 _server_dir = Path(__file__).parent.resolve()
@@ -46,6 +48,65 @@ sys.path.insert(0, str(_server_dir))
 from config import METADATA_FILE
 
 ADMIN_KEY = "_system_admins_"
+
+# bcrypt salt rounds (cost factor 12 = ~250ms per hash on modern hardware)
+BCRYPT_ROUNDS = 12
+
+
+def _hash_password_bcrypt(password: str) -> str:
+    """Hash a password using bcrypt."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(BCRYPT_ROUNDS)).decode("utf-8")
+
+
+def _verify_password_bcrypt(password: str, password_hash: str) -> bool:
+    """Verify a password against a bcrypt hash."""
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
+
+
+def _is_bcrypt_hash(password_hash: str) -> bool:
+    """Check if a password hash is a bcrypt hash (starts with $2)."""
+    return password_hash.startswith("$2")
+
+
+def _verify_password_legacy(password: str, password_hash: str) -> bool:
+    """Verify a password against a legacy SHA256 hash."""
+    return hashlib.sha256(password.encode()).hexdigest() == password_hash
+
+
+def verify_admin_password(username: str, password: str) -> bool:
+    """Verify admin username and password. Supports both bcrypt and legacy SHA256."""
+    meta = load_metadata()
+    if ADMIN_KEY not in meta:
+        return False
+
+    for user in meta[ADMIN_KEY]["users"]:
+        if user["username"] != username:
+            continue
+        stored_hash = user.get("password_hash", "")
+        if not stored_hash:
+            continue
+
+        # New bcrypt hash
+        if _is_bcrypt_hash(stored_hash):
+            if _verify_password_bcrypt(password, stored_hash):
+                return True
+        else:
+            # Legacy SHA256 hash — verify and upgrade to bcrypt
+            if _verify_password_legacy(password, stored_hash):
+                # Upgrade: re-hash with bcrypt and save
+                new_hash = _hash_password_bcrypt(password)
+                user["password_hash"] = new_hash
+                save_metadata(meta)
+                return True
+    return False
+
+
+def hash_admin_password(password: str) -> str:
+    """Hash an admin password using bcrypt. Use this instead of raw SHA256."""
+    return _hash_password_bcrypt(password)
 
 
 def load_metadata() -> Dict[str, Any]:
@@ -73,7 +134,9 @@ def get_file_meta(key: str) -> Optional[Dict[str, Any]]:
 
 
 def update_file_meta(key: str, title: str = None, description: str = None, product_line: str = None, password: str = None) -> None:
-    """Update title, description, product_line, and/or password for a file."""
+    """Update title, description, product_line, and/or password for a file.
+    Password is stored as bcrypt hash, not plain text.
+    """
     meta = load_metadata()
     if key not in meta:
         meta[key] = {}
@@ -84,7 +147,11 @@ def update_file_meta(key: str, title: str = None, description: str = None, produ
     if product_line is not None:
         meta[key]["product_line"] = product_line
     if password is not None:
-        meta[key]["password"] = password
+        # Store bcrypt hash, not plain text
+        if password:
+            meta[key]["password"] = _hash_password_bcrypt(password)
+        else:
+            meta[key]["password"] = None
     save_metadata(meta)
 
 
@@ -235,7 +302,10 @@ def set_file_meta(
     if product_line:
         meta[key]["product_line"] = product_line
     if password is not None:
-        meta[key]["password"] = password
+        meta[key]["password"] = _hash_password_bcrypt(password) if password else None
+    # init_upload_time is set only on first upload, never changed
+    if "init_upload_time" not in meta[key]:
+        meta[key]["init_upload_time"] = datetime.now().isoformat()
     # Initialize version tracking
     meta[key]["current_version"] = "V1"
     meta[key]["versions"] = {
@@ -263,14 +333,22 @@ def file_exists(key: str) -> bool:
 
 
 def check_file_password(key: str, password: str) -> bool:
-    """Check if the provided password matches the file's password."""
+    """Check if the provided password matches the file's stored bcrypt hash."""
     meta = load_metadata()
     if key not in meta:
         return False
-    file_password = meta[key].get("password")
-    if not file_password:
+    stored_hash = meta[key].get("password")
+    if not stored_hash:
         return True  # No password set, allow access
-    return file_password == password
+    # Backward compatibility: if stored value is not a bcrypt hash, treat as legacy plain-text
+    if not _is_bcrypt_hash(stored_hash):
+        # Legacy plain-text password — upgrade to bcrypt on successful match
+        if stored_hash == password:
+            meta[key]["password"] = _hash_password_bcrypt(password)
+            save_metadata(meta)
+            return True
+        return False
+    return _verify_password_bcrypt(password, stored_hash)
 
 
 def has_password(key: str) -> bool:
@@ -279,6 +357,37 @@ def has_password(key: str) -> bool:
     if key not in meta:
         return False
     return bool(meta[key].get("password"))
+
+
+def set_file_password(key: str, password: str) -> None:
+    """Set or update a file's password (stores bcrypt hash, not plain text)."""
+    meta = load_metadata()
+    if key not in meta:
+        meta[key] = {}
+    if password:
+        meta[key]["password"] = _hash_password_bcrypt(password)
+    else:
+        meta[key]["password"] = None
+    save_metadata(meta)
+
+
+def migrate_file_passwords() -> Dict[str, Any]:
+    """
+    Migrate all plain-text file passwords to bcrypt.
+    Returns a report of migrations performed.
+    """
+    meta = load_metadata()
+    migrated = []
+    for key, data in meta.items():
+        if key.startswith(ADMIN_KEY):
+            continue
+        pw = data.get("password")
+        if pw and not _is_bcrypt_hash(pw):
+            data["password"] = _hash_password_bcrypt(pw)
+            migrated.append(key)
+    if migrated:
+        save_metadata(meta)
+    return {"migrated": migrated, "count": len(migrated)}
 
 
 # ── Admin Management ──────────────────────────────────────────────────────────
@@ -291,8 +400,11 @@ def get_admins() -> List[Dict[str, str]]:
     return [{"username": a["username"], "created_at": a.get("created_at", "")} for a in admins]
 
 
-def add_admin(username: str, password_hash: str) -> bool:
-    """Add a new admin user. Returns True if added, False if already exists."""
+def add_admin(username: str, password_hash: str, force_password_change: bool = False) -> bool:
+    """Add a new admin user. Returns True if added, False if already exists.
+    password_hash should already be bcrypt-hashed via hash_admin_password().
+    If force_password_change is True, the admin must change their password on next login.
+    """
     meta = load_metadata()
     if ADMIN_KEY not in meta:
         meta[ADMIN_KEY] = {"users": []}
@@ -306,6 +418,7 @@ def add_admin(username: str, password_hash: str) -> bool:
         "username": username,
         "password_hash": password_hash,
         "created_at": datetime.now().isoformat(),
+        "force_password_change": force_password_change,
     })
     save_metadata(meta)
     return True
@@ -328,23 +441,8 @@ def remove_admin(username: str) -> bool:
     return False
 
 
-def verify_admin_password(username: str, password: str) -> bool:
-    """Verify admin username and password. Returns True if valid."""
-    import hashlib
-    meta = load_metadata()
-    if ADMIN_KEY not in meta:
-        return False
-
-    pwd_hash = hashlib.sha256(password.encode()).hexdigest()
-
-    for user in meta[ADMIN_KEY]["users"]:
-        if user["username"] == username and user.get("password_hash") == pwd_hash:
-            return True
-    return False
-
-
 def update_admin_password(username: str, new_password_hash: str) -> bool:
-    """Update admin password. Returns True if updated."""
+    """Update admin password. Returns True if updated. new_password_hash should be bcrypt-hashed."""
     meta = load_metadata()
     if ADMIN_KEY not in meta:
         return False
@@ -363,3 +461,29 @@ def is_super_admin(username: str) -> bool:
     if ADMIN_KEY not in meta or not meta[ADMIN_KEY].get("users"):
         return False
     return meta[ADMIN_KEY]["users"][0]["username"] == username
+
+
+def must_change_password(username: str) -> bool:
+    """Check if an admin must change their password on next login."""
+    meta = load_metadata()
+    if ADMIN_KEY not in meta:
+        return False
+    for user in meta[ADMIN_KEY]["users"]:
+        if user["username"] == username:
+            return bool(user.get("force_password_change", False))
+    return False
+
+
+def clear_force_password_change(username: str) -> bool:
+    """Clear the force_password_change flag for an admin."""
+    meta = load_metadata()
+    if ADMIN_KEY not in meta:
+        return False
+    for user in meta[ADMIN_KEY]["users"]:
+        if user["username"] == username:
+            if user.get("force_password_change"):
+                user["force_password_change"] = False
+                save_metadata(meta)
+                return True
+            return True  # Already false, consider it cleared
+    return False

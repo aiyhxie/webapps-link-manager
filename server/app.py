@@ -32,7 +32,6 @@ API 路由：
 import sys
 import json
 import secrets
-import hashlib
 import logging
 from pathlib import Path
 from typing import Dict
@@ -49,6 +48,7 @@ sys.path.insert(0, str(_server_dir))
 from config import WEBAPPS_DIR, HOST, PORT, VERSION
 import metadata
 import file_manager
+import changelog
 
 # Setup logging
 LOG_DIR = _server_dir.parent / "logs"
@@ -73,7 +73,8 @@ def log_file_action(action: str, detail: str):
     """Log file actions."""
     logger.info(f"FILE {action}: {detail}")
 
-# In-memory token store: token -> {password, filename, expires_at}
+# In-memory token store: token -> {filename}
+# (No password stored — token is proof of prior password verification)
 _access_tokens: Dict[str, Dict] = {}
 
 # In-memory admin session store: token -> username
@@ -110,6 +111,12 @@ def create_app():
     app = Flask(__name__, template_folder="templates")
     app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100MB max upload
 
+    # Keep PRD.md changelog table in sync with changelog.json on startup
+    try:
+        changelog.sync_prd_changelog()
+    except Exception as e:
+        logger.warning(f"PRD changelog sync failed on startup: {e}")
+
     def get_client_ip():
         """Get client IP from headers or remote_addr."""
         ip = request.headers.get("X-Forwarded-For")
@@ -141,12 +148,14 @@ def create_app():
         # Check if any admins exist
         admins = metadata.get_admins()
         has_admins = len(admins) > 0
+        must_change = metadata.must_change_password(username) if username else False
         return jsonify({
             "success": True,
             "isLoggedIn": bool(username),
             "username": username,
             "isSuperAdmin": is_super,
             "hasAdmins": has_admins,
+            "mustChangePassword": must_change,
         })
 
     @app.route("/api/admin/setup", methods=["POST"])
@@ -166,9 +175,8 @@ def create_app():
         if len(username) < 2 or len(password) < 6:
             return jsonify({"success": False, "message": "用户名至少2字符，密码至少6字符"}), 400
 
-        import hashlib
-        pwd_hash = hashlib.sha256(password.encode()).hexdigest()
-        if metadata.add_admin(username, pwd_hash):
+        pwd_hash = metadata.hash_admin_password(password)
+        if metadata.add_admin(username, pwd_hash, force_password_change=True):
             log_admin_action(username, "创建超级管理员")
             return jsonify({"success": True, "message": "管理员创建成功，请登录"})
         else:
@@ -188,6 +196,7 @@ def create_app():
             token = secrets.token_urlsafe(32)
             _admin_sessions[token] = username
             is_super = metadata.is_super_admin(username)
+            must_change = metadata.must_change_password(username)
             log_admin_action(username, "登录", f"超级管理员" if is_super else "普通管理员")
             return jsonify({
                 "success": True,
@@ -195,6 +204,7 @@ def create_app():
                 "token": token,
                 "username": username,
                 "isSuperAdmin": is_super,
+                "mustChangePassword": must_change,
             })
         else:
             client_ip = get_client_ip()
@@ -240,8 +250,7 @@ def create_app():
         if len(username) < 2 or len(password) < 6:
             return jsonify({"success": False, "message": "用户名至少2字符，密码至少6字符"}), 400
 
-        import hashlib
-        pwd_hash = hashlib.sha256(password.encode()).hexdigest()
+        pwd_hash = metadata.hash_admin_password(password)
         if metadata.add_admin(username, pwd_hash):
             log_admin_action(get_current_admin(), "添加管理员", username)
             return jsonify({"success": True, "message": "管理员添加成功"})
@@ -286,12 +295,16 @@ def create_app():
         if len(new_password) < 6:
             return jsonify({"success": False, "message": "新密码至少6字符"}), 400
 
+        if old_password == new_password:
+            return jsonify({"success": False, "message": "新密码不能与旧密码相同"}), 400
+
         username = get_current_admin()
         if not metadata.verify_admin_password(username, old_password):
             return jsonify({"success": False, "message": "旧密码错误"}), 400
 
-        new_hash = hashlib.sha256(new_password.encode()).hexdigest()
+        new_hash = metadata.hash_admin_password(new_password)
         if metadata.update_admin_password(username, new_hash):
+            metadata.clear_force_password_change(username)
             log_admin_action(username, "修改密码")
             return jsonify({"success": True, "message": "密码已更新"})
         else:
@@ -464,8 +477,9 @@ def create_app():
             else:
                 return jsonify({"success": False, "message": msg}), 400
         else:
-            # Handle HTML: archive old content and save new
-            success, message, _ = file_manager.upload_file(file_data, filename, client_ip)
+            # Handle HTML: archive old content and save new (in place, preserving
+            # the project's real nested path derived from its key)
+            success, message, _ = file_manager.update_file_version(key, file_data, client_ip)
             if success:
                 versions_info = metadata.get_versions(key)
                 current_v = versions_info.get("current_version", "V1")
@@ -538,7 +552,19 @@ def create_app():
             "ip": file_manager.get_local_ip(),
             "port": PORT,
             "webappsDir": str(WEBAPPS_DIR),
-            "version": VERSION,
+            # Read live from changelog.json so newly recorded versions show
+            # without needing a server restart.
+            "version": changelog.get_latest_version(),
+        })
+
+    @app.route("/api/changelog", methods=["GET"])
+    def get_changelog():
+        """Get all changelog entries (newest first)."""
+        entries = changelog.get_changelog_entries()
+        return jsonify({
+            "success": True,
+            "data": entries,
+            "current_version": VERSION,
         })
 
     @app.route("/api/files/<path:key>/session", methods=["GET"])
@@ -554,15 +580,11 @@ def create_app():
         if not has_password:
             return jsonify({"success": True, "hasAccess": True, "hasPassword": False})
 
-        # Validate token against stored plain-text password (consistent with check_password)
+        # Validate token: check it exists and matches the filename
         is_valid = False
-        stored_password = meta.get("password", "")
         if token and token in _access_tokens:
             token_data = _access_tokens[token]
-            # Compare plain-text password directly
-            # Also check password hasn't changed since token was issued
-            if (token_data["filename"] == filename and
-                token_data["password"] == stored_password):
+            if token_data["filename"] == filename:
                 is_valid = True
 
         return jsonify({"success": True, "hasAccess": is_valid, "hasPassword": has_password})
@@ -577,9 +599,8 @@ def create_app():
             token = secrets.token_urlsafe(32)
             # Get filename from key
             filename = key[5:] if key.startswith("file:") else key
-            # Store token permanently, bound to plain-text password (for consistent comparison)
+            # Store token (no password stored — token itself grants access)
             _access_tokens[token] = {
-                "password": password,
                 "filename": filename,
             }
             log_file_action("访问受保护文件", f"{key} - 密码验证成功")
@@ -802,9 +823,7 @@ def create_app():
         is_valid_token = False
         if token and token in _access_tokens:
             token_data = _access_tokens[token]
-            # Check filename and plain-text password match (consistent with check_password)
-            if (token_data["filename"] == filename and
-                token_data["password"] == meta["password"]):
+            if token_data["filename"] == filename:
                 is_valid_token = True
                 # Token remains valid for reuse
 
@@ -886,8 +905,7 @@ def create_app():
             is_valid_token = False
             if token and token in _access_tokens:
                 token_data = _access_tokens[token]
-                if (token_data["filename"] == filename and
-                    token_data["password"] == meta["password"]):
+                if token_data["filename"] == filename:
                     is_valid_token = True
             if not is_valid_token:
                 return """

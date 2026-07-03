@@ -18,14 +18,15 @@
  */
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { ConfigProvider, Layout, Typography, message, Input, Button, Space, Card, Empty, Tooltip, Popconfirm, Drawer, Badge, Dropdown, MenuProps, Modal, Form } from 'antd';
-import { SearchOutlined, ReloadOutlined, CopyOutlined, EditOutlined, DeleteOutlined, DesktopOutlined, GlobalOutlined, MenuOutlined, AppstoreOutlined, SunOutlined, MoonOutlined, MoreOutlined, PlusOutlined, CheckOutlined, LockOutlined, UnlockOutlined, InboxOutlined, UserOutlined, LogoutOutlined, TeamOutlined } from '@ant-design/icons';
+import { SearchOutlined, CopyOutlined, EditOutlined, DeleteOutlined, DesktopOutlined, GlobalOutlined, MenuOutlined, AppstoreOutlined, SunOutlined, MoonOutlined, MoreOutlined, PlusOutlined, CheckOutlined, LockOutlined, UnlockOutlined, InboxOutlined, UserOutlined, LogoutOutlined, TeamOutlined } from '@ant-design/icons';
 import EditModal from './components/EditModal';
 import PasswordModal from './components/PasswordModal';
-import type { FileInfo } from './types';
+import ChangelogModal from './components/ChangelogModal';
+import type { FileInfo, ChangelogEntry } from './types';
 import { PRODUCT_LINES } from './types';
 import { api, setAdminToken, clearAdminToken, getAdminToken } from './api';
 
-type SortMode = 'time_desc' | 'time_asc' | 'product_line' | 'ip';
+type SortMode = 'init_desc' | 'init_asc' | 'update_desc' | 'update_asc' | 'product_line' | 'ip';
 
 const { Header, Sider, Content } = Layout;
 const { Text } = Typography;
@@ -73,6 +74,13 @@ function App() {
   const [versionFile, setVersionFile] = useState<FileInfo | null>(null);
   const [versionList, setVersionList] = useState<Record<string, { upload_time: string; uploader_ip: string }>>({});
   const [currentVersion, setCurrentVersion] = useState('');
+
+  // Changelog state
+  const [changelogVisible, setChangelogVisible] = useState(false);
+  const [changelogEntries, setChangelogEntries] = useState<ChangelogEntry[]>([]);
+
+  // Card-level success tip state
+  const [successTip, setSuccessTip] = useState<{ key: string; message: string } | null>(null);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     const saved = localStorage.getItem('themeMode');
     return (saved as ThemeMode) || 'auto';
@@ -80,12 +88,13 @@ function App() {
 
   const [sortMode, setSortMode] = useState<SortMode>(() => {
     const saved = localStorage.getItem('sortMode');
-    return (saved as SortMode) || 'time_desc';
+    return (saved as SortMode) || 'init_desc';
   });
 
   const [isDragging, setIsDragging] = useState(false);
   const [draggingOverKey, setDraggingOverKey] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const versionInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
   // Admin state
   const [adminLoggedIn, setAdminLoggedIn] = useState(false);
@@ -136,9 +145,25 @@ function App() {
     }
   }, []);
 
+  const loadChangelog = useCallback(async () => {
+    try {
+      const data = await api.getChangelog();
+      if (data.success && data.data) {
+        setChangelogEntries(data.data);
+      }
+    } catch {
+      // silently fail - changelog is not critical
+    }
+  }, []);
+
+  const handleShowChangelog = useCallback(() => {
+    loadChangelog().then(() => setChangelogVisible(true));
+  }, [loadChangelog]);
+
   useEffect(() => {
     loadFiles();
-  }, [loadFiles]);
+    loadChangelog();
+  }, [loadFiles, loadChangelog]);
 
   // Check admin status on load
   useEffect(() => {
@@ -198,29 +223,29 @@ function App() {
     // Sort files
     result.sort((a, b) => {
       switch (sortMode) {
-        case 'time_desc':
-          // Newest first (by upload_time)
+        case 'init_desc':
+          return (b.init_upload_time || '').localeCompare(a.init_upload_time || '');
+        case 'init_asc':
+          return (a.init_upload_time || '').localeCompare(b.init_upload_time || '');
+        case 'update_desc':
           return (b.upload_time || '').localeCompare(a.upload_time || '');
-        case 'time_asc':
-          // Oldest first
+        case 'update_asc':
           return (a.upload_time || '').localeCompare(b.upload_time || '');
         case 'product_line': {
-          // Product line first, then by time desc
           const plA = a.productLine || '';
           const plB = b.productLine || '';
           if (plA !== plB) {
             return plA.localeCompare(plB);
           }
-          return (b.upload_time || '').localeCompare(a.upload_time || '');
+          return (b.init_upload_time || '').localeCompare(a.init_upload_time || '');
         }
         case 'ip': {
-          // IP first, then by time desc
           const ipA = a.uploader_ip || '';
           const ipB = b.uploader_ip || '';
           if (ipA !== ipB) {
             return ipA.localeCompare(ipB);
           }
-          return (b.upload_time || '').localeCompare(a.upload_time || '');
+          return (b.init_upload_time || '').localeCompare(a.init_upload_time || '');
         }
         default:
           return 0;
@@ -235,6 +260,11 @@ function App() {
     if (result.success) {
       message.success(result.message || '上传成功');
       loadFiles();
+      // Show card-level success tip
+      if (result.data?.key) {
+        setSuccessTip({ key: result.data.key, message: '项目添加成功' });
+        setTimeout(() => setSuccessTip(null), 3000);
+      }
     } else {
       message.error(result.message || '上传失败');
     }
@@ -441,17 +471,21 @@ function App() {
     setVersionModalVisible(true);
   };
 
-  const handleUploadNewVersion = async (file: File) => {
-    if (!versionFile) return;
-    const result = await api.uploadNewVersion(versionFile.key, file);
+  const handleUploadNewVersion = async (targetFile: FileInfo, file: File) => {
+    const result = await api.uploadNewVersion(targetFile.key, file);
     if (result.success) {
-      message.success(`${versionFile.title} ${result.version} 版本更新成功`);
+      message.success(`${targetFile.title} ${result.version} 版本更新成功`);
       loadFiles();
-      // Refresh version list
-      const vr = await api.getVersions(versionFile.key);
-      if (vr.success && vr.data) {
-        setVersionList(vr.data.versions || {});
-        setCurrentVersion(vr.data.current_version || 'V1');
+      // Show card-level success tip
+      setSuccessTip({ key: targetFile.key, message: `已更新为 ${result.version} 版本` });
+      setTimeout(() => setSuccessTip(null), 3000);
+      // Refresh version list only if the version history modal is open for this file
+      if (versionFile?.key === targetFile.key) {
+        const vr = await api.getVersions(targetFile.key);
+        if (vr.success && vr.data) {
+          setVersionList(vr.data.versions || {});
+          setCurrentVersion(vr.data.current_version || 'V1');
+        }
       }
     } else {
       message.error(result.message || '版本更新失败');
@@ -567,9 +601,24 @@ function App() {
     setThemeMode(newMode);
   };
 
+  const getSortBase = (mode: SortMode) => mode.replace('_desc', '').replace('_asc', '');
+  const isSortDesc = (mode: SortMode) => mode.endsWith('_desc');
+
   const onSortChange = (value: SortMode) => {
-    localStorage.setItem('sortMode', value);
-    setSortMode(value);
+    const currentBase = getSortBase(sortMode);
+    const newBase = getSortBase(value);
+    // "默认" (init_desc) does not toggle
+    if (currentBase === 'init' && newBase === 'init') {
+      return;
+    }
+    let newMode: SortMode;
+    if (currentBase === newBase) {
+      newMode = isSortDesc(sortMode) ? (newBase + '_asc') as SortMode : (newBase + '_desc') as SortMode;
+    } else {
+      newMode = value;
+    }
+    localStorage.setItem('sortMode', newMode);
+    setSortMode(newMode);
   };
 
   const SidebarContent = () => (
@@ -726,16 +775,16 @@ function App() {
             style={{ color: textColor, display: 'none' }}
           />
 
-          {/* Left: Logo & Title */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          {/* Left: Logo & Title (fixed width to span the sidebar area) */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, width: 200, flexShrink: 0 }}>
             <img src={logoUrl} alt="logo" style={{ height: 28, width: 'auto' }} />
             <span className="header-title" style={{ fontSize: 18, fontWeight: 600, color: textColor, whiteSpace: 'nowrap' }}>
               原型极速分享平台
             </span>
           </div>
 
-          {/* Center: Search */}
-          <div style={{ flex: 1, maxWidth: 400, margin: '0 24px' }} className="header-search">
+          {/* Center: Search — left edge aligned with project cards (sider 220 + padding 28) */}
+          <div style={{ flex: 1, maxWidth: 400, marginLeft: 28, marginRight: 24 }} className="header-search">
             <Input
               prefix={<SearchOutlined style={{ color: textSecondary }} />}
               placeholder="搜索文件名..."
@@ -872,28 +921,33 @@ function App() {
                 </div>
                 {/* Sort Options */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, marginLeft: 24 }}>
-                  <span style={{ fontSize: 13, opacity: 0.8 }}>排序:</span>
                   {[
-                    { key: 'time_desc' as SortMode, label: '默认' },
+                    { key: 'init_desc' as SortMode, label: '默认排序' },
+                    { key: 'update_desc' as SortMode, label: '更新时间' },
                     { key: 'product_line' as SortMode, label: '产品线' },
                     { key: 'ip' as SortMode, label: '上传者' },
-                  ].map(opt => (
-                    <Button
-                      key={opt.key}
-                      size="small"
-                      type={sortMode === opt.key ? 'primary' : 'text'}
-                      onClick={() => onSortChange(opt.key)}
-                      style={{
-                        borderRadius: 16,
-                        padding: '2px 12px',
-                        height: 28,
-                        fontSize: 12,
-                        ...(sortMode === opt.key ? {} : { color: 'rgba(255,255,255,0.85)', borderColor: 'rgba(255,255,255,0.3)' }),
-                      }}
-                    >
-                      {opt.label}
-                    </Button>
-                  ))}
+                  ].map(opt => {
+                    const isActive = getSortBase(sortMode) === getSortBase(opt.key);
+                    // "默认" does not show direction arrow
+                    const arrow = (opt.key === 'init_desc') ? '' : (isSortDesc(sortMode) && isActive ? ' ↓' : (!isSortDesc(sortMode) && isActive ? ' ↑' : ''));
+                    return (
+                      <Button
+                        key={opt.key}
+                        size="small"
+                        type={isActive ? 'primary' : 'text'}
+                        onClick={() => onSortChange(opt.key)}
+                        style={{
+                          borderRadius: 16,
+                          padding: '2px 12px',
+                          height: 28,
+                          fontSize: 12,
+                          ...(isActive ? {} : { color: 'rgba(255,255,255,0.85)', borderColor: 'rgba(255,255,255,0.3)' }),
+                        }}
+                      >
+                        {opt.label}{arrow}
+                      </Button>
+                    );
+                  })}
                 </div>
               </Card>
 
@@ -916,7 +970,7 @@ function App() {
                     className="file-card upload-card"
                     style={{
                       background: isDragging
-                        ? (currentTheme === 'dark' ? 'rgba(138,180,248,0.2)' : '#e8f0fe')
+                        ? (currentTheme === 'dark' ? 'rgba(138,180,248,0.85)' : 'rgba(66,133,244,0.75)')
                         : cardBg,
                       border: `2px dashed ${isDragging ? (currentTheme === 'dark' ? '#8ab4f8' : '#4285f4') : borderColor}`,
                       borderRadius: 12,
@@ -938,8 +992,8 @@ function App() {
                     />
                     {isDragging ? (
                       <>
-                        <InboxOutlined style={{ fontSize: 28, color: currentTheme === 'dark' ? '#8ab4f8' : '#4285f4', marginBottom: 8 }} />
-                        <div style={{ color: currentTheme === 'dark' ? '#8ab4f8' : '#4285f4', fontSize: 13 }}>释放以上传</div>
+                        <InboxOutlined style={{ fontSize: 28, color: '#ffffff', marginBottom: 8 }} />
+                        <div style={{ color: '#ffffff', fontSize: 13 }}>释放以上传</div>
                       </>
                     ) : (
                       <>
@@ -977,7 +1031,7 @@ function App() {
                             if (!file.canDelete) {
                               message.error(`${file.title}：暂无编辑权限`);
                             } else {
-                              handleUploadNewVersion(f);
+                              handleUploadNewVersion(file, f);
                             }
                           }
                         }}
@@ -991,6 +1045,21 @@ function App() {
                         }}
                         bodyStyle={{ padding: 0, display: 'flex', flexDirection: 'column', height: '100%' }}
                       >
+                        {/* Success tip banner */}
+                        {successTip?.key === file.key && (
+                          <div style={{
+                            background: '#52c41a',
+                            color: '#fff',
+                            fontSize: 12,
+                            padding: '4px 12px',
+                            textAlign: 'center',
+                            borderRadius: '12px 12px 0 0',
+                            flexShrink: 0,
+                          }}>
+                            {successTip.message}
+                          </div>
+                        )}
+
                         {/* Card Header */}
                         <div
                           style={{
@@ -1051,6 +1120,50 @@ function App() {
                                 </span>
                               </Tooltip>
                             )}
+                            {/* Hidden per-card input for uploading a new version.
+                                onClick stopPropagation prevents the programmatic
+                                input.click() event from bubbling to the Card and
+                                triggering handleCardClick (opening project detail). */}
+                            <input
+                              ref={(el) => { versionInputRefs.current[file.key] = el; }}
+                              type="file"
+                              accept=".html,.HTML,.zip,.ZIP"
+                              style={{ display: 'none' }}
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) => {
+                                const f = e.target.files?.[0];
+                                if (f) {
+                                  if (!file.canDelete) {
+                                    message.error(`${file.title}：暂无编辑权限`);
+                                  } else {
+                                    handleUploadNewVersion(file, f);
+                                  }
+                                }
+                                e.target.value = '';
+                              }}
+                            />
+                            {file.canDelete && (
+                              <Tooltip title="上传新版本">
+                                <Button
+                                  size="small"
+                                  type="text"
+                                  icon={<PlusOutlined />}
+                                  onClick={(e) => { e.stopPropagation(); versionInputRefs.current[file.key]?.click(); }}
+                                  style={{ color: textSecondary, flexShrink: 0 }}
+                                />
+                              </Tooltip>
+                            )}
+                            {file.canDelete && (
+                              <Tooltip title="编辑信息">
+                                <Button
+                                  size="small"
+                                  type="text"
+                                  icon={<EditOutlined />}
+                                  onClick={(e) => { e.stopPropagation(); handleEdit(file); }}
+                                  style={{ color: textSecondary, flexShrink: 0 }}
+                                />
+                              </Tooltip>
+                            )}
                             {file.hasPassword && (
                               <Tooltip title={file.canDelete ? '已加密，点击修改' : '已加密'}>
                                 <Button
@@ -1073,43 +1186,6 @@ function App() {
                                 />
                               </Tooltip>
                             )}
-                            {file.canDelete && (
-                              <Tooltip title="上传新版本">
-                                <Button
-                                  size="small"
-                                  type="text"
-                                  icon={<PlusOutlined />}
-                                  onClick={(e) => { e.stopPropagation(); document.getElementById(`version-upload-${file.key.replace(/[^a-zA-Z0-9]/g, '_')}`)?.click(); }}
-                                  style={{ color: textSecondary, flexShrink: 0 }}
-                                />
-                              </Tooltip>
-                            )}
-                            <input
-                              id={`version-upload-${file.key.replace(/[^a-zA-Z0-9]/g, '_')}`}
-                              type="file"
-                              accept=".html,.HTML,.zip,.ZIP"
-                              style={{ display: 'none' }}
-                              onChange={(e) => {
-                                const f = e.target.files?.[0];
-                                if (f) {
-                                  if (!file.canDelete) {
-                                    message.error(`${file.title}：暂无编辑权限`);
-                                  } else {
-                                    handleUploadNewVersion(f);
-                                  }
-                                }
-                                e.target.value = '';
-                              }}
-                            />
-                            {file.canDelete && (
-                              <Button
-                                size="small"
-                                type="text"
-                                icon={<EditOutlined />}
-                                onClick={(e) => { e.stopPropagation(); handleEdit(file); }}
-                                style={{ color: textSecondary, flexShrink: 0 }}
-                              />
-                            )}
                           </div>
                         </div>
 
@@ -1119,7 +1195,7 @@ function App() {
                             style={{
                               position: 'absolute',
                               inset: 0,
-                              background: currentTheme === 'dark' ? 'rgba(138,180,248,0.3)' : 'rgba(66,133,244,0.15)',
+                              background: currentTheme === 'dark' ? 'rgba(138,180,248,0.85)' : 'rgba(66,133,244,0.75)',
                               borderRadius: 12,
                               display: 'flex',
                               flexDirection: 'column',
@@ -1129,8 +1205,8 @@ function App() {
                               pointerEvents: 'none',
                             }}
                           >
-                            <InboxOutlined style={{ fontSize: 28, color: currentTheme === 'dark' ? '#8ab4f8' : '#4285f4' }} />
-                            <div style={{ color: currentTheme === 'dark' ? '#8ab4f8' : '#4285f4', fontSize: 13, marginTop: 8 }}>
+                            <InboxOutlined style={{ fontSize: 28, color: '#ffffff' }} />
+                            <div style={{ color: '#ffffff', fontSize: 13, marginTop: 8 }}>
                               释放以更新版本
                             </div>
                           </div>
@@ -1182,13 +1258,9 @@ function App() {
                               >
                                 <Button
                                   size="small"
-                                  danger
-                                  icon={<DeleteOutlined />}
+                                  icon={<DeleteOutlined style={{ color: '#ff4d4f' }} />}
                                   onClick={(e) => e.stopPropagation()}
-                                  style={{
-                                    flexShrink: 0,
-                                    borderColor: currentTheme === 'dark' ? '#ff7875' : undefined,
-                                  }}
+                                  style={{ flexShrink: 0 }}
                                 />
                               </Popconfirm>
                             )}
@@ -1225,13 +1297,6 @@ function App() {
                   )}
                 </div>
               )}
-
-              {/* Refresh Button */}
-              <div style={{ textAlign: 'center', marginTop: 24 }}>
-                <Button icon={<ReloadOutlined />} onClick={loadFiles} style={{ borderRadius: 20 }}>
-                  刷新列表
-                </Button>
-              </div>
             </div>
           </Content>
         </div>
@@ -1287,6 +1352,14 @@ function App() {
         onClose={() => setPasswordModalVisible(false)}
         onSubmit={handlePasswordSubmit}
         onClearPassword={handleClearPassword}
+      />
+
+      {/* Changelog Modal */}
+      <ChangelogModal
+        visible={changelogVisible}
+        entries={changelogEntries}
+        currentVersion={version}
+        onClose={() => setChangelogVisible(false)}
       />
 
       {/* Admin Login Modal */}
@@ -1537,7 +1610,11 @@ function App() {
             padding: '2px 10px',
             borderRadius: 10,
           }}>
-            <Text style={{ color: textSecondary, fontSize: 12 }}>
+            <Text
+              style={{ color: textSecondary, fontSize: 12, cursor: 'pointer' }}
+              onClick={handleShowChangelog}
+              title="点击查看版本更新日志"
+            >
               版本号: v{version}
             </Text>
           </div>

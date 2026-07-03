@@ -289,6 +289,16 @@ def scan_webapps() -> List[Dict[str, Any]]:
                 "description": desc,
                 "uploader_ip": uploader_ip,
                 "upload_time": meta.get("upload_time"),
+                "init_upload_time": (
+                    meta.get("init_upload_time")
+                    or (
+                        min(
+                            (v.get("upload_time") for v in meta.get("versions", {}).values() if v.get("upload_time")),
+                            default=None
+                        )
+                    )
+                    or meta.get("upload_time")
+                ),
                 "isDir": False,
                 "url": f"/protected/{item.name}" if has_password else f"/files/{item.name}",
                 "productLine": product_line,
@@ -348,6 +358,16 @@ def scan_webapps() -> List[Dict[str, Any]]:
                     "description": desc,
                     "uploader_ip": uploader_ip,
                     "upload_time": meta.get("upload_time"),
+                    "init_upload_time": (
+                        meta.get("init_upload_time")
+                        or (
+                            min(
+                                (v.get("upload_time") for v in meta.get("versions", {}).values() if v.get("upload_time")),
+                                default=None
+                            )
+                        )
+                        or meta.get("upload_time")
+                    ),
                     "isDir": False,
                     "url": f"/protected/{rel_path.as_posix()}" if has_password else f"/files/{rel_path.as_posix()}",
                     "productLine": product_line,
@@ -409,11 +429,12 @@ def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool
         # Check if metadata already exists (new version vs new file)
         existing_meta = metadata.get_file_meta(key)
         if existing_meta:
-            # Update existing metadata with new upload time
+            # Update existing metadata — upload_time tracks latest version upload
+            # init_upload_time is preserved (first creation time)
             meta = metadata.load_metadata()
             meta[key]["upload_time"] = datetime.now().isoformat()
             meta[key]["uploader_ip"] = uploader_ip
-            # Preserve password and other settings
+            # Preserve password and other settings; init_upload_time stays unchanged
             metadata.save_metadata(meta)
         else:
             # Save new metadata
@@ -683,20 +704,19 @@ def extract_zip_for_version(zip_data: bytes, target_filename: str, uploader_ip: 
 
             # Read the main HTML content
             main_content = zf.read(main_entry)
-            title, description = extract_html_description(main_content)
+            title, description = extract_html_title_description(main_content)
 
             # Get target key
             key = f"file:{target_filename}"
 
-            # Archive current content if exists
+            # Archive current content if exists (flattened archive name so nested
+            # projects don't require sub-directories under VERSIONS_DIR)
             current_path = WEBAPPS_DIR / target_filename
             if current_path.exists():
                 old_content = current_path.read_bytes()
                 old_meta = metadata.get_file_meta(key)
                 prev_version = old_meta.get("current_version", "V1") if old_meta else "V1"
-                version_filename = f"{target_filename}__{prev_version}"
-                version_path = VERSIONS_DIR / version_filename
-                version_path.write_bytes(old_content)
+                _archive_path(target_filename, prev_version).write_bytes(old_content)
                 # Add new version
                 metadata.add_version(key, uploader_ip)
 
@@ -789,22 +809,106 @@ def can_delete(key: str, request_ip: str) -> bool:
     return stored_ip == request_ip
 
 
+def update_file_version(key: str, file_data: bytes, uploader_ip: str) -> Tuple[bool, str, str]:
+    """
+    Update an EXISTING project with new HTML content as a new version.
+
+    Unlike upload_file(), this preserves the project's real (possibly nested)
+    path derived from its key, so subdirectory projects (e.g.
+    file:uploaded_x/index.html) are updated in place instead of being written
+    to the webapps root.
+
+    Returns (success, message, key).
+    """
+    if not key.startswith("file:"):
+        return False, "无效的文件key", ""
+
+    rel_path = key[5:]
+
+    # Reject path traversal and ensure the resolved target stays inside WEBAPPS_DIR
+    if ".." in rel_path:
+        return False, "无效的文件路径", ""
+    dest_path = (WEBAPPS_DIR / rel_path)
+    try:
+        resolved = dest_path.resolve()
+        resolved.relative_to(WEBAPPS_DIR.resolve())
+    except (ValueError, OSError):
+        return False, "无效的文件路径", ""
+
+    # Version update targets an existing project only
+    if not dest_path.exists():
+        return False, "文件不存在", ""
+
+    try:
+        # Archive current content as the previous version (flattened archive name)
+        old_content = dest_path.read_bytes()
+        old_meta = metadata.get_file_meta(key)
+        prev_version = old_meta.get("current_version", "V1") if old_meta else "V1"
+        _archive_path(rel_path, prev_version).write_bytes(old_content)
+
+        # Register the new version and write new content in place
+        metadata.add_version(key, uploader_ip)
+        dest_path.write_bytes(file_data)
+
+        # Refresh metadata (preserve title/description/password/product_line)
+        title, description = extract_html_title_description(file_data)
+        meta = metadata.load_metadata()
+        if key in meta:
+            meta[key]["upload_time"] = datetime.now().isoformat()
+            meta[key]["uploader_ip"] = uploader_ip
+            if not meta[key].get("title") and title:
+                meta[key]["title"] = title
+            save = True
+        else:
+            save = False
+        if save:
+            metadata.save_metadata(meta)
+
+        versions_info = metadata.get_versions(key)
+        current_v = versions_info.get("current_version", "V1")
+        return True, f"已更新为 {current_v} 版本", key
+    except Exception as e:
+        return False, f"版本更新失败: {str(e)}", ""
+
+
 # ── Historical Version File Management ────────────────────────────────────────
+
+def _archive_stem(filename: str) -> str:
+    """
+    Flatten a (possibly nested) relative filename into a safe, slash-free stem
+    used for storing historical version archives in VERSIONS_DIR.
+
+    e.g. "uploaded_x/index.html" -> "uploaded_x_index.html"
+         "AIOPC_V3.3-.html"      -> "AIOPC_V3.3-.html"  (unchanged for root files,
+                                    so existing archives stay compatible)
+    """
+    return filename.replace("/", "_")
+
+
+def _archive_path(filename: str, version: str) -> Path:
+    """Return the VERSIONS_DIR path for a given file/version archive."""
+    return VERSIONS_DIR / f"{_archive_stem(filename)}__{version}"
+
 
 def get_version_content(filename: str, version: str) -> Optional[bytes]:
     """
     Get the content of a historical version file.
     Returns bytes if found, None if not found.
     """
-    # Try exact match first
-    version_filename = f"{filename}__{version}"
-    version_path = VERSIONS_DIR / version_filename
+    # Try flattened archive name first (current scheme)
+    version_path = _archive_path(filename, version)
     if version_path.exists():
         return version_path.read_bytes()
 
-    # Try case-insensitive match
+    # Backward-compat: legacy archives that kept the raw filename
+    legacy_path = VERSIONS_DIR / f"{filename}__{version}"
+    if legacy_path.exists():
+        return legacy_path.read_bytes()
+
+    # Fallback: match by flattened stem prefix + version suffix
+    stem = _archive_stem(filename)
     for vf in VERSIONS_DIR.iterdir():
-        if vf.name.startswith(filename) and vf.name.endswith(f"__{version}"):
+        if vf.name.startswith(stem) and vf.name.endswith(f"__{version}"):
             return vf.read_bytes()
 
     return None
@@ -839,9 +943,7 @@ def restore_version_file(key: str, version: str, request_ip: str) -> Tuple[bool,
         current_content = get_current_content(filename)
         if current_content:
             current_v = current_meta.get("current_version", "V1")
-            version_filename = f"{filename}__{current_v}"
-            version_path = VERSIONS_DIR / version_filename
-            version_path.write_bytes(current_content)
+            _archive_path(filename, current_v).write_bytes(current_content)
         # Update metadata
         ok, msg = metadata.restore_version(key, version)
         if not ok:
@@ -867,16 +969,20 @@ def delete_version_file(key: str, version: str, request_ip: str) -> Tuple[bool, 
     # Get filename from key
     filename = key[5:] if key.startswith("file:") else key
 
-    # Find and delete the version file
-    version_filename = f"{filename}__{version}"
-    version_path = VERSIONS_DIR / version_filename
+    # Find and delete the version file (flattened archive name)
+    version_path = _archive_path(filename, version)
 
-    # Try case-insensitive match
+    # Fall back to legacy raw-name archive, then prefix match
     if not version_path.exists():
-        for vf in VERSIONS_DIR.iterdir():
-            if vf.name.startswith(filename) and vf.name.endswith(f"__{version}"):
-                version_path = vf
-                break
+        legacy_path = VERSIONS_DIR / f"{filename}__{version}"
+        if legacy_path.exists():
+            version_path = legacy_path
+        else:
+            stem = _archive_stem(filename)
+            for vf in VERSIONS_DIR.iterdir():
+                if vf.name.startswith(stem) and vf.name.endswith(f"__{version}"):
+                    version_path = vf
+                    break
 
     if not version_path.exists():
         # No physical file, but remove from metadata

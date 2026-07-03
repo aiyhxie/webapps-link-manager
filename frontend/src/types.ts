@@ -18,7 +18,8 @@ export interface FileInfo {
   title: string;         // 显示标题
   description: string;   // 文件描述
   uploader_ip: string | null;  // 上传者 IP
-  upload_time: string | null;  // 上传时间（ISO 格式）
+  upload_time: string | null;  // 上传时间（ISO 格式，当前版本的上传时间）
+  init_upload_time: string | null;  // 初始上传时间（首次创建的时间）
   isDir: boolean;        // 是否为目录（预留）
   url: string;           // 访问 URL
   canDelete: boolean;    // 当前用户是否有权删除
@@ -37,6 +38,14 @@ export interface VersionInfo {
 export interface VersionsResponse {
   current_version: string;
   versions: Record<string, VersionInfo>;
+}
+
+// 系统版本更新记录
+export interface ChangelogEntry {
+  version: string;
+  date: string;
+  changelog: string;
+  type: string;  // "feature" | "security" | "fix" | "other"
 }
 
 // API 统一响应格式

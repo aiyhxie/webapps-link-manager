@@ -12,7 +12,7 @@
  * - 系统状态：getStatus
  */
 
-import type { FileInfo, ApiResponse, VersionsResponse } from './types';
+import type { FileInfo, ApiResponse, VersionsResponse, ChangelogEntry } from './types';
 
 // API 基础路径
 const API_BASE = '/api';
@@ -102,6 +102,11 @@ export const api = {
 
   async getStatus(): Promise<ApiResponse & { version?: string }> {
     const res = await fetch(`${API_BASE}/status`);
+    return res.json();
+  },
+
+  async getChangelog(): Promise<ApiResponse & { data?: ChangelogEntry[]; current_version?: string }> {
+    const res = await fetch(`${API_BASE}/changelog`);
     return res.json();
   },
 
