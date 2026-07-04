@@ -24,7 +24,7 @@ import PasswordModal from './components/PasswordModal';
 import ChangelogModal from './components/ChangelogModal';
 import type { FileInfo, ChangelogEntry } from './types';
 import { PRODUCT_LINES } from './types';
-import { api, setAdminToken, clearAdminToken, getAdminToken } from './api';
+import { api, setAdminToken, clearAdminToken } from './api';
 
 type SortMode = 'init_desc' | 'init_asc' | 'update_desc' | 'update_asc' | 'product_line' | 'ip';
 
@@ -1456,7 +1456,7 @@ function App() {
             <>
               {/* View Logs Button */}
               <div style={{ marginBottom: 16 }}>
-                <Button block onClick={() => window.open('/logs?token=' + encodeURIComponent(getAdminToken() || ''), '_blank')}>
+                <Button block onClick={() => window.open('/logs', '_blank')}>
                   📋 查看系统日志
                 </Button>
               </div>

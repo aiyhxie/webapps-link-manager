@@ -1,6 +1,24 @@
 {
-  "last_recorded_version": "1.0.11",
+  "last_recorded_version": "1.0.14",
   "entries": [
+    {
+      "version": "1.0.14",
+      "date": "2026-07-04T15:29:56.320522",
+      "changelog": "重建系统日志为结构化审计日志(logs/audit.jsonl)：只记录项目增删改、管理员动作、项目级访问三类；不再记录静态资源/子页面访问；支持按关键字与操作者(IP或管理员姓名)及类别查询；日志查看页重建为可筛选表格；废弃旧文本日志",
+      "type": "feature"
+    },
+    {
+      "version": "1.0.13",
+      "date": "2026-07-04T15:00:14.313009",
+      "changelog": "修复管理员查看系统日志报'请先登录'的问题：日志页改为同源localStorage读取管理员token并以X-Admin-Token头请求/api/logs，token不再进URL；移除失效的一次性log token机制",
+      "type": "fix"
+    },
+    {
+      "version": "1.0.12",
+      "date": "2026-07-04T11:14:11.943676",
+      "changelog": "修复含中文(非ASCII)路径的文件设置密码后输入正确密码仍无法访问的问题：访问令牌Cookie名改用文件名哈希，确保Cookie名为纯ASCII可正常写入与读取",
+      "type": "fix"
+    },
     {
       "version": "1.0.11",
       "date": "2026-07-03T15:34:18.746287",

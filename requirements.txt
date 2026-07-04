@@ -1,0 +1,4 @@
+# WebApps Link Manager - Python 依赖
+# 安装：pip3 install -r requirements.txt
+flask>=3.0,<4.0
+bcrypt>=4.0

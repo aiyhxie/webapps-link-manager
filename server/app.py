@@ -32,6 +32,7 @@ API 路由：
 import sys
 import json
 import secrets
+import hashlib
 import logging
 from pathlib import Path
 from typing import Dict
@@ -49,29 +50,12 @@ from config import WEBAPPS_DIR, HOST, PORT, VERSION
 import metadata
 import file_manager
 import changelog
+import audit
 
-# Setup logging
-LOG_DIR = _server_dir.parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOG_DIR / "webapps.log"
-
-# Configure logger
+# Minimal logger for internal warnings/errors (not the audit trail)
 logger = logging.getLogger("webapps")
-logger.setLevel(logging.INFO)
-handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
-logger.addHandler(handler)
-
-def log_admin_action(username: str, action: str, detail: str = ""):
-    """Log admin actions."""
-    if detail:
-        logger.info(f"ADMIN [{username}] {action}: {detail}")
-    else:
-        logger.info(f"ADMIN [{username}] {action}")
-
-def log_file_action(action: str, detail: str):
-    """Log file actions."""
-    logger.info(f"FILE {action}: {detail}")
+logger.setLevel(logging.WARNING)
+logger.addHandler(logging.StreamHandler())
 
 # In-memory token store: token -> {filename}
 # (No password stored — token is proof of prior password verification)
@@ -81,30 +65,13 @@ _access_tokens: Dict[str, Dict] = {}
 _admin_sessions: Dict[str, str] = {}
 
 # One-time short-lived log viewer tokens: token -> expiry timestamp
-_log_viewer_tokens: Dict[str, float] = {}
-
-
-def _make_log_token() -> str:
-    """Generate a short-lived one-time log viewer token (5 minutes)."""
-    import time
-    token = secrets.token_urlsafe(24)
-    _log_viewer_tokens[token] = time.time() + 300  # 5 minutes
-    return token
-
-
-def _check_log_token(token: str) -> bool:
-    """Check if a log token is valid and not expired. Consumes it immediately (one-time use)."""
-    import time
-    if token not in _log_viewer_tokens:
-        return False
-    if time.time() > _log_viewer_tokens.pop(token):
-        return False
-    return True
-
-
 def _safe_cookie_name(filename: str) -> str:
-    """Generate a safe cookie name from filename - replaces / with _ to avoid cookie parsing issues."""
-    return f"file_token_{filename.replace('/', '_')}"
+    """Generate an ASCII-safe, stable cookie name from a (possibly non-ASCII)
+    filename. Cookie names must be ASCII; filenames containing Chinese or other
+    non-ASCII chars would otherwise be mangled by the HTTP layer and break the
+    access-token round-trip. Hashing yields a deterministic ASCII-only name."""
+    digest = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:32]
+    return f"file_token_{digest}"
 
 
 def create_app():
@@ -137,6 +104,46 @@ def create_app():
         """Check if current admin is super admin."""
         username = get_current_admin()
         return metadata.is_super_admin(username) if username else False
+
+    # ── Audit logging helpers ────────────────────────────────────────────────────
+
+    def _project_title(key: str) -> str:
+        """Resolve a human-friendly project title from its key; fallback to key."""
+        meta = metadata.get_file_meta(key)
+        if meta and meta.get("title"):
+            return meta["title"]
+        return key[5:] if key.startswith("file:") else key
+
+    def audit_admin(action: str, target: str = "", detail: str = "", actor: str = None):
+        """Record a管理员 action (actor = admin name, plus source IP)."""
+        audit.log("admin", action,
+                  actor=(actor if actor is not None else get_current_admin()),
+                  ip=get_client_ip(), target=target, detail=detail)
+
+    def audit_project(action: str, key: str, detail: str = ""):
+        """Record a project CRUD action. actor = admin name if logged in else IP."""
+        admin = get_current_admin()
+        ip = get_client_ip()
+        audit.log("project", action, actor=(admin or ip), ip=ip,
+                  target=_project_title(key), detail=detail)
+
+    def audit_access(key: str, detail: str = ""):
+        """Record a project-level access (actor = viewer IP)."""
+        ip = get_client_ip()
+        audit.log("access", "查看项目", actor=ip, ip=ip,
+                  target=_project_title(key), detail=detail)
+
+    def _project_key_for_path(filename: str):
+        """Return the project key if `filename` is a project ENTRY (root .html or
+        <dir>/index.html), else None — so static assets/sub-pages aren't logged."""
+        if not filename or ".." in filename:
+            return None
+        parts = filename.split("/")
+        if len(parts) == 1 and filename.lower().endswith(".html"):
+            return f"file:{filename}"          # root-level project
+        if len(parts) == 2 and parts[1].lower() == "index.html":
+            return f"file:{filename}"          # first-level folder project entry
+        return None
 
     # ── API Routes ──────────────────────────────────────────────────────────────
 
@@ -177,7 +184,7 @@ def create_app():
 
         pwd_hash = metadata.hash_admin_password(password)
         if metadata.add_admin(username, pwd_hash, force_password_change=True):
-            log_admin_action(username, "创建超级管理员")
+            audit_admin("创建超级管理员", target=username, actor=username)
             return jsonify({"success": True, "message": "管理员创建成功，请登录"})
         else:
             return jsonify({"success": False, "message": "创建失败"}), 500
@@ -197,7 +204,7 @@ def create_app():
             _admin_sessions[token] = username
             is_super = metadata.is_super_admin(username)
             must_change = metadata.must_change_password(username)
-            log_admin_action(username, "登录", f"超级管理员" if is_super else "普通管理员")
+            audit_admin("登录", detail=("超级管理员" if is_super else "普通管理员"), actor=username)
             return jsonify({
                 "success": True,
                 "message": "登录成功",
@@ -207,8 +214,7 @@ def create_app():
                 "mustChangePassword": must_change,
             })
         else:
-            client_ip = get_client_ip()
-            logger.warning(f"LOGIN FAILED | 用户名: {username} | IP: {client_ip}")
+            audit_admin("登录失败", target=username, detail="用户名或密码错误", actor=username)
             return jsonify({"success": False, "message": "用户名或密码错误"}), 401
 
     @app.route("/api/admin/logout", methods=["POST"])
@@ -218,7 +224,7 @@ def create_app():
         if token in _admin_sessions:
             username = _admin_sessions[token]
             del _admin_sessions[token]
-            log_admin_action(username, "退出登录")
+            audit_admin("退出登录", actor=username)
         return jsonify({"success": True, "message": "已退出登录"})
 
     @app.route("/api/admin/users", methods=["GET"])
@@ -252,7 +258,7 @@ def create_app():
 
         pwd_hash = metadata.hash_admin_password(password)
         if metadata.add_admin(username, pwd_hash):
-            log_admin_action(get_current_admin(), "添加管理员", username)
+            audit_admin("添加管理员", target=username)
             return jsonify({"success": True, "message": "管理员添加成功"})
         else:
             return jsonify({"success": False, "message": "用户名已存在"}), 400
@@ -274,7 +280,7 @@ def create_app():
             for token, uname in list(_admin_sessions.items()):
                 if uname == username:
                     del _admin_sessions[token]
-            log_admin_action(current_user, "删除管理员", username)
+            audit_admin("删除管理员", target=username, actor=current_user)
             return jsonify({"success": True, "message": "管理员已删除"})
         else:
             return jsonify({"success": False, "message": "管理员不存在"}), 404
@@ -305,7 +311,7 @@ def create_app():
         new_hash = metadata.hash_admin_password(new_password)
         if metadata.update_admin_password(username, new_hash):
             metadata.clear_force_password_change(username)
-            log_admin_action(username, "修改密码")
+            audit_admin("修改密码", actor=username)
             return jsonify({"success": True, "message": "密码已更新"})
         else:
             return jsonify({"success": False, "message": "密码更新失败"}), 500
@@ -348,7 +354,8 @@ def create_app():
             zip_data = file.read()
             success, message, keys = file_manager.extract_zip(zip_data, client_ip)
             if success:
-                log_file_action("上传ZIP", f"{original_filename} -> {keys}")
+                for k in (keys or []):
+                    audit_project("新建项目", k, detail=f"ZIP上传 {original_filename}")
                 return jsonify({"success": True, "message": message, "keys": keys})
             else:
                 return jsonify({"success": False, "message": message}), 400
@@ -366,7 +373,7 @@ def create_app():
             file_data = file.read()
             success, message, key = file_manager.upload_file(file_data, safe_name, client_ip)
             if success:
-                log_file_action("上传HTML", f"{safe_name} by IP {client_ip}")
+                audit_project("新建项目", key, detail=f"HTML上传 {safe_name}")
                 return jsonify({"success": True, "message": message, "key": key})
             else:
                 return jsonify({"success": False, "message": message}), 400
@@ -413,14 +420,9 @@ def create_app():
 
         admin_user = get_current_admin()
         if password is not None:
-            if admin_user:
-                log_admin_action(admin_user, "设置密码" if password else "清除密码", f"{key}")
-            else:
-                log_file_action("设置密码" if password else "清除密码", f"{key}")
-        elif admin_user:
-            log_admin_action(admin_user, "编辑项目", f"{key}")
-        elif title or description:
-            log_file_action("编辑", f"{key}")
+            audit_project("设置密码" if password else "清除密码", key)
+        elif title is not None or description is not None or product_line is not None:
+            audit_project("编辑信息", key)
 
         return jsonify({"success": True, "message": "已更新"})
 
@@ -472,7 +474,7 @@ def create_app():
             if success:
                 versions_info = metadata.get_versions(key)
                 current_v = versions_info.get("current_version", "V1")
-                log_file_action("上传新版本ZIP", f"{key} -> {current_v}")
+                audit_project("上传新版本", key, detail=f"ZIP -> {current_v}")
                 return jsonify({"success": True, "message": msg, "version": current_v})
             else:
                 return jsonify({"success": False, "message": msg}), 400
@@ -483,7 +485,7 @@ def create_app():
             if success:
                 versions_info = metadata.get_versions(key)
                 current_v = versions_info.get("current_version", "V1")
-                log_file_action("上传新版本", f"{key} -> {current_v}")
+                audit_project("上传新版本", key, detail=f"-> {current_v}")
                 return jsonify({"success": True, "message": message, "version": current_v})
             else:
                 return jsonify({"success": False, "message": message}), 400
@@ -499,10 +501,7 @@ def create_app():
 
         success, message = file_manager.restore_version_file(key, version, client_ip)
         if success:
-            if admin_user:
-                log_admin_action(admin_user, "恢复版本", f"{key} -> {version}")
-            else:
-                log_file_action("恢复版本", f"{key} -> {version}")
+            audit_project("恢复版本", key, detail=f"-> {version}")
             return jsonify({"success": True, "message": message})
         else:
             return jsonify({"success": False, "message": message}), 400
@@ -518,10 +517,7 @@ def create_app():
 
         success, message = file_manager.delete_version_file(key, version, client_ip)
         if success:
-            if admin_user:
-                log_admin_action(admin_user, "删除版本", f"{key} {version}")
-            else:
-                log_file_action("删除版本", f"{key} {version}")
+            audit_project("删除版本", key, detail=f"{version}")
             return jsonify({"success": True, "message": message})
         else:
             return jsonify({"success": False, "message": message}), 400
@@ -534,10 +530,7 @@ def create_app():
         success, message = file_manager.delete_file(key, client_ip)
 
         if success:
-            if admin_user:
-                log_admin_action(admin_user, "删除项目", f"{key}")
-            else:
-                log_file_action("删除", f"{key} by IP {client_ip}")
+            audit_project("删除项目", key)
             return jsonify({"success": True, "message": message})
         else:
             status = 403 if "无权" in message else 404 if "不存在" in message else 400
@@ -603,7 +596,8 @@ def create_app():
             _access_tokens[token] = {
                 "filename": filename,
             }
-            log_file_action("访问受保护文件", f"{key} - 密码验证成功")
+            # Note: the actual project view is logged when /protected serves the
+            # entry page, so we don't log password verification separately here.
             # Set HttpOnly cookie instead of returning token in response body
             resp = jsonify({"success": True, "message": "密码正确"})
             resp.set_cookie(
@@ -616,181 +610,148 @@ def create_app():
             )
             return resp
         else:
-            log_file_action("访问受保护文件", f"{key} - 密码错误")
             return jsonify({"success": False, "message": "密码错误"}), 401
 
     # ── Log Viewing ──────────────────────────────────────────────────────────────
 
-    @app.route("/api/logs/token", methods=["GET"])
-    def create_log_token():
-        """Generate a one-time log viewer token. Requires valid admin session."""
+    @app.route("/api/logs", methods=["GET"])
+    def get_logs():
+        """Get audit log entries (structured). Requires a valid admin session
+        token via X-Admin-Token header. Supports filtering:
+          - q:        keyword substring (action/target/detail/actor/ip/category)
+          - actor:    operator filter (matches admin name OR IP)
+          - category: project | admin | access
+        """
         admin_token = request.headers.get("X-Admin-Token", "")
         if not admin_token or admin_token not in _admin_sessions:
             return jsonify({"success": False, "message": "未登录"}), 401
-        new_log_tok = _make_log_token()
-        return jsonify({"success": True, "token": new_log_tok})
 
-    @app.route("/api/logs", methods=["GET"])
-    def get_logs():
-        """Get recent log entries (admin only)."""
-        # Accept one-time log viewer token (consumes it) OR admin session token
-        log_token = request.args.get("log_token", "")
-        admin_token = request.headers.get("X-Admin-Token", "")
-        # One-time log token takes priority
-        if log_token and _check_log_token(log_token):
-            pass  # valid, one-time token consumed
-        elif admin_token and admin_token in _admin_sessions:
-            pass  # valid admin session
-        else:
-            return jsonify({"success": False, "message": "未登录"}), 401
-
+        q = request.args.get("q", "")
+        actor = request.args.get("actor", "")
+        category = request.args.get("category", "")
         try:
-            if LOG_FILE.exists():
-                lines = LOG_FILE.read_text(encoding="utf-8").strip().split("\n")
-                # Return last 500 lines
-                recent = lines[-500:] if len(lines) > 500 else lines
-                return jsonify({"success": True, "logs": recent})
-            else:
-                return jsonify({"success": True, "logs": []})
+            entries = audit.query(q=q, actor=actor, category=category, limit=1000)
+            return jsonify({"success": True, "logs": entries})
         except Exception as e:
             return jsonify({"success": False, "message": str(e)}), 500
 
     @app.route("/logs", methods=["GET"])
     def view_logs():
-        """Serve log viewer page (admin only)."""
-        # Accept one-time log viewer token
-        log_token = request.args.get("log_token", "")
-        admin_token = request.headers.get("X-Admin-Token", "")
+        """Serve the log viewer page shell.
 
-        if log_token and _check_log_token(log_token):
-            pass  # valid one-time token consumed
-        elif admin_token and admin_token in _admin_sessions:
-            pass  # valid admin session
-        else:
-            return "<html><body style='font-family: sans-serif; text-align: center; padding: 60px;'><h1>请先登录管理员账号</h1><p>当前会话已过期或未登录</p><p><a href='/'>返回首页</a></p></body></html>", 401
-
+        The shell contains no sensitive data — the real authorization boundary
+        is /api/logs, which requires a valid admin session token sent as the
+        X-Admin-Token header. The page's JS reads the token from same-origin
+        localStorage, so no token is ever placed in the URL.
+        """
         return """
         <!DOCTYPE html>
-        <html>
+        <html lang="zh-CN">
         <head>
             <meta charset="utf-8">
             <title>系统日志 - WebApps</title>
             <style>
                 * { box-sizing: border-box; margin: 0; padding: 0; }
                 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1e1e1e; color: #d4d4d4; min-height: 100vh; }
-                .header { background: #323232; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #404040; }
+                .header { background: #323232; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #404040; position: sticky; top: 0; z-index: 5; }
                 .header h1 { color: #fff; font-size: 18px; }
-                .header .btn { background: #0e639c; color: #fff; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; }
-                .header .btn:hover { background: #1177bb; }
-                .log-container { padding: 20px; }
-                .log-entry { background: #252526; border: 1px solid #3c3c3c; border-radius: 4px; padding: 10px 14px; margin-bottom: 8px; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; line-height: 1.5; }
-                .log-entry .time { color: #858585; margin-right: 12px; }
-                .log-entry .level { margin-right: 12px; }
-                .log-entry .level.INFO { color: #4ec9b0; }
-                .log-entry .level.WARNING { color: #dcdcaa; }
-                .log-entry .level.ERROR { color: #f14c4c; }
-                .log-entry .admin { color: #569cd6; }
-                .log-entry .file { color: #ce9178; }
-                .log-entry .login-failed { color: #f14c4c; }
-                .filter-bar { background: #323232; padding: 12px 24px; display: flex; gap: 12px; align-items: center; border-bottom: 1px solid #404040; }
-                .filter-bar input { background: #3c3c3c; border: 1px solid #555; color: #d4d4d4; padding: 6px 12px; border-radius: 4px; width: 200px; }
-                .filter-bar label { color: #ccc; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+                .btn { background: #0e639c; color: #fff; border: none; padding: 7px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+                .btn:hover { background: #1177bb; }
+                .filter-bar { background: #2a2a2a; padding: 12px 24px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #404040; position: sticky; top: 51px; z-index: 4; }
+                .filter-bar input, .filter-bar select { background: #3c3c3c; border: 1px solid #555; color: #d4d4d4; padding: 6px 10px; border-radius: 4px; font-size: 13px; }
+                .filter-bar input { width: 220px; }
+                .filter-bar .hint { color: #777; font-size: 12px; margin-left: auto; }
+                .wrap { padding: 16px 24px; }
+                table { width: 100%; border-collapse: collapse; font-size: 13px; }
+                th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #333; vertical-align: top; }
+                th { color: #9aa0a6; font-weight: 500; position: sticky; top: 96px; background: #1e1e1e; }
+                tr:hover td { background: #262626; }
+                .time { color: #858585; white-space: nowrap; font-variant-numeric: tabular-nums; }
+                .cat { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; white-space: nowrap; }
+                .cat.project { background: rgba(78,201,176,.15); color: #4ec9b0; }
+                .cat.admin { background: rgba(86,156,214,.15); color: #569cd6; }
+                .cat.access { background: rgba(206,145,120,.15); color: #ce9178; }
+                .actor { color: #dcdcaa; }
+                .ip { color: #9aa0a6; font-family: 'Consolas','Monaco',monospace; white-space: nowrap; }
+                .action { color: #e8eaed; }
+                .action.danger { color: #f14c4c; }
+                .target { color: #cbd5e1; word-break: break-all; }
+                .detail { color: #777; }
                 .empty { text-align: center; padding: 60px; color: #666; }
             </style>
         </head>
         <body>
             <div class="header">
-                <h1>📋 系统日志</h1>
-                <button class="btn" onclick="refreshLogs()">🔄 刷新</button>
+                <h1>📋 系统操作日志</h1>
+                <button class="btn" onclick="loadLogs()">🔄 刷新</button>
             </div>
             <div class="filter-bar">
-                <input type="text" id="searchInput" placeholder="搜索日志内容..." onkeyup="filterLogs()">
-                <label><input type="checkbox" id="filterAdmin" checked onchange="filterLogs()"> 管理员操作</label>
-                <label><input type="checkbox" id="filterFile" checked onchange="filterLogs()"> 文件操作</label>
-                <label><input type="checkbox" id="filterLogin" checked onchange="filterLogs()"> 登录记录</label>
+                <input type="text" id="q" placeholder="按关键字搜索…" oninput="debouncedLoad()">
+                <input type="text" id="actor" placeholder="按操作者搜索（IP 或 管理员姓名）" oninput="debouncedLoad()">
+                <select id="category" onchange="loadLogs()">
+                    <option value="">全部类别</option>
+                    <option value="project">项目增删改</option>
+                    <option value="admin">管理员动作</option>
+                    <option value="access">访问记录</option>
+                </select>
+                <span class="hint" id="count"></span>
             </div>
-            <div class="log-container" id="logContainer">
-                <div class="empty">加载中...</div>
+            <div class="wrap" id="wrap">
+                <div class="empty">加载中…</div>
             </div>
             <script>
-                let allLogs = [];
-                let _adminTok = new URLSearchParams(window.location.search).get('admin_token') || '';
-
+                const CAT_NAME = { project: '项目', admin: '管理员', access: '访问' };
+                let _timer = null;
+                function debouncedLoad() { clearTimeout(_timer); _timer = setTimeout(loadLogs, 300); }
+                function esc(s) {
+                    return String(s == null ? '' : s)
+                        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                        .replace(/"/g,'&quot;');
+                }
                 async function loadLogs() {
+                    const wrap = document.getElementById('wrap');
+                    const adminTok = localStorage.getItem('adminToken') || '';
+                    if (!adminTok) { wrap.innerHTML = '<div class="empty">请先在首页登录管理员账号，再打开本页面</div>'; return; }
+                    const q = document.getElementById('q').value.trim();
+                    const actor = document.getElementById('actor').value.trim();
+                    const category = document.getElementById('category').value;
+                    const params = new URLSearchParams();
+                    if (q) params.set('q', q);
+                    if (actor) params.set('actor', actor);
+                    if (category) params.set('category', category);
                     try {
-                        const logTok = new URLSearchParams(window.location.search).get('log_token') || '';
-                        const adminTok = new URLSearchParams(window.location.search).get('admin_token') || '';
-                        let url = '/api/logs?log_token=' + encodeURIComponent(logTok);
-                        if (!logTok && adminTok) {
-                            // Need a fresh one-time log token - get it first
-                            const tokResp = await fetch('/api/logs/token', { headers: { 'X-Admin-Token': adminTok } });
-                            const tokData = await tokResp.json();
-                            if (!tokData.success || !tokData.token) {
-                                document.getElementById('logContainer').innerHTML = '<div class="empty">会话过期，请刷新页面重试</div>';
-                                return;
-                            }
-                            url = '/api/logs?log_token=' + encodeURIComponent(tokData.token);
-                        }
-                        const resp = await fetch(url);
+                        const resp = await fetch('/api/logs?' + params.toString(), { headers: { 'X-Admin-Token': adminTok } });
+                        if (resp.status === 401) { wrap.innerHTML = '<div class="empty">会话已过期，请回首页重新登录管理员账号</div>'; return; }
                         const data = await resp.json();
-                        if (data.success && data.logs) {
-                            allLogs = data.logs;
-                            renderLogs(allLogs);
-                        } else if (data.message) {
-                            document.getElementById('logContainer').innerHTML = '<div class="empty">' + data.message + '</div>';
-                        }
+                        if (data.success && Array.isArray(data.logs)) { render(data.logs); }
+                        else { wrap.innerHTML = '<div class="empty">' + esc(data.message || '加载失败') + '</div>'; }
                     } catch(e) {
-                        document.getElementById('logContainer').innerHTML = '<div class="empty">加载失败: ' + e.message + '</div>';
+                        wrap.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>';
                     }
                 }
-
-                function filterLogs() {
-                    const search = document.getElementById('searchInput').value.toLowerCase();
-                    const showAdmin = document.getElementById('filterAdmin').checked;
-                    const showFile = document.getElementById('filterFile').checked;
-                    const showLogin = document.getElementById('filterLogin').checked;
-
-                    const filtered = allLogs.filter(log => {
-                        if (search && !log.toLowerCase().includes(search)) return false;
-                        if (log.includes('ADMIN') && !showAdmin) return false;
-                        if ((log.includes('FILE') || log.includes('上传') || log.includes('删除') || log.includes('编辑')) && !showFile) return false;
-                        if ((log.includes('登录') || log.includes('LOGIN') || log.includes('退出')) && !showLogin) return false;
-                        return true;
-                    });
-
-                    renderLogs(filtered);
-                }
-
-                function renderLogs(logs) {
-                    const container = document.getElementById('logContainer');
-                    if (logs.length === 0) {
-                        container.innerHTML = '<div class="empty">暂无日志记录</div>';
-                        return;
-                    }
-
-                    container.innerHTML = logs.map(log => {
-                        let level = 'INFO';
-                        if (log.includes('WARNING')) level = 'WARNING';
-                        if (log.includes('ERROR') || log.includes('FAILED')) level = 'ERROR';
-
-                        // Format the log entry
-                        let formatted = log;
-                        formatted = formatted.replace(/\[([^\]]+)\]/g, '<span class="admin">[$1]</span>');
-                        formatted = formatted.replace(/(FILE|上传|删除|编辑)/g, '<span class="file">$1</span>');
-                        formatted = formatted.replace(/(LOGIN FAILED)/g, '<span class="login-failed">$1</span>');
-
-                        return '<div class="log-entry"><span class="time">' + log.split('|')[0].trim() + '</span><span class="level ' + level + '">' + level + '</span>' + formatted + '</div>';
+                function fmtTime(t) { return String(t || '').replace('T', ' '); }
+                function render(logs) {
+                    const wrap = document.getElementById('wrap');
+                    document.getElementById('count').textContent = '共 ' + logs.length + ' 条';
+                    if (!logs.length) { wrap.innerHTML = '<div class="empty">暂无匹配的日志记录</div>'; return; }
+                    let rows = logs.map(function(e) {
+                        const cat = e.category || '';
+                        const danger = /删除|失败/.test(e.action || '') ? ' danger' : '';
+                        return '<tr>' +
+                            '<td class="time">' + esc(fmtTime(e.time)) + '</td>' +
+                            '<td><span class="cat ' + esc(cat) + '">' + esc(CAT_NAME[cat] || cat) + '</span></td>' +
+                            '<td class="actor">' + esc(e.actor) + '</td>' +
+                            '<td class="ip">' + esc(e.ip) + '</td>' +
+                            '<td class="action' + danger + '">' + esc(e.action) + '</td>' +
+                            '<td class="target">' + esc(e.target) + '</td>' +
+                            '<td class="detail">' + esc(e.detail) + '</td>' +
+                        '</tr>';
                     }).join('');
+                    wrap.innerHTML = '<table><thead><tr>' +
+                        '<th>时间</th><th>类别</th><th>操作者</th><th>来源IP</th><th>操作</th><th>项目/对象</th><th>备注</th>' +
+                        '</tr></thead><tbody>' + rows + '</tbody></table>';
                 }
-
-                function refreshLogs() {
-                    loadLogs();
-                }
-
-                // Load on init
                 loadLogs();
-                // Auto refresh every 10 seconds using stored admin token
-                setInterval(loadLogs, 10000);
             </script>
         </body>
         </html>
@@ -801,7 +762,10 @@ def create_app():
     @app.route("/files/<path:filename>")
     def serve_file(filename):
         """Serve files from webapps directory."""
-        log_file_action("访问文件", filename)
+        # Only log project-level entry views (not static assets/sub-pages)
+        pkey = _project_key_for_path(filename)
+        if pkey:
+            audit_access(pkey)
         return send_from_directory(WEBAPPS_DIR, filename)
 
     @app.route("/protected/<path:filename>")
@@ -812,7 +776,9 @@ def create_app():
 
         if not meta or not meta.get("password"):
             # No password required, serve normally
-            log_file_action("访问文件", filename)
+            pkey = _project_key_for_path(filename)
+            if pkey:
+                audit_access(pkey)
             return send_from_directory(WEBAPPS_DIR, filename)
 
         # Check token from cookie (secure, not in URL)
@@ -882,7 +848,9 @@ def create_app():
             </html>
             """
 
-        log_file_action("访问受保护文件", filename)
+        pkey = _project_key_for_path(filename)
+        if pkey:
+            audit_access(pkey)
         return send_from_directory(WEBAPPS_DIR, filename)
 
     @app.route("/assets/<path:filename>")
@@ -919,13 +887,13 @@ def create_app():
         # Try historical version first
         content = file_manager.get_version_content(filename, version)
         if content is not None:
-            log_file_action("访问历史版本", f"{filename} {version}")
+            audit_access(key, detail=f"历史版本 {version}")
             return content, 200, {"Content-Type": "text/html; charset=utf-8"}
 
         # Fall back to current version
         content = file_manager.get_current_content(filename)
         if content is not None:
-            log_file_action("访问文件(版本降级)", f"{filename} (requested {version}, showing current)")
+            audit_access(key, detail=f"请求{version}，返回当前版本")
             return content, 200, {"Content-Type": "text/html; charset=utf-8"}
 
         return "文件不存在", 404
