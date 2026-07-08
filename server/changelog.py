@@ -33,6 +33,10 @@ import sys
 sys.path.insert(0, str(_server_dir))
 
 from config import BASE_DIR, CHANGELOG_FILE, DEFAULT_VERSION
+from atomic_store import AtomicJSONStore
+
+_EMPTY_CHANGELOG = {"last_recorded_version": "", "entries": []}
+_store = AtomicJSONStore(CHANGELOG_FILE, empty_default=_EMPTY_CHANGELOG)
 
 # Change type classification based on keywords in changelog notes
 CHANGE_TYPE_KEYWORDS = {
@@ -52,21 +56,13 @@ def _classify_change(changelog: str) -> str:
 
 
 def load_changelog() -> Dict[str, Any]:
-    """Load changelog from JSON file."""
-    if not CHANGELOG_FILE.exists():
-        return {"last_recorded_version": "", "entries": []}
-    try:
-        return json.loads(CHANGELOG_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, IOError):
-        return {"last_recorded_version": "", "entries": []}
+    """Load changelog from JSON file (atomic, self-healing on corruption)."""
+    return _store.load()
 
 
 def save_changelog(data: Dict[str, Any]) -> None:
-    """Save changelog to JSON file."""
-    CHANGELOG_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    """Save changelog to JSON file (atomic write with automatic backup)."""
+    _store.save(data)
 
 
 def get_changelog_entries() -> List[Dict[str, Any]]:
@@ -114,23 +110,21 @@ def record_version(version: str, changelog_notes: str, change_type: str = None) 
     Record a specific version in changelog.json.
     Returns True if a new entry was added, False if version already recorded.
     """
-    data = load_changelog()
+    with _store.transaction() as data:
+        data.setdefault("entries", [])
+        if data.get("last_recorded_version") == version:
+            return False
 
-    # Don't record if already exists
-    if data.get("last_recorded_version") == version:
-        return False
+        entry = {
+            "version": version,
+            "date": datetime.now().isoformat(),
+            "changelog": changelog_notes,
+            "type": change_type or _classify_change(changelog_notes),
+        }
 
-    entry = {
-        "version": version,
-        "date": datetime.now().isoformat(),
-        "changelog": changelog_notes,
-        "type": change_type or _classify_change(changelog_notes),
-    }
-
-    data["entries"].insert(0, entry)  # Prepend (newest first)
-    data["last_recorded_version"] = version
-    save_changelog(data)
-    return True
+        data["entries"].insert(0, entry)  # Prepend (newest first)
+        data["last_recorded_version"] = version
+        return True
 
 
 def add_entry(summary: str, change_type: str = None) -> Optional[str]:
@@ -142,17 +136,34 @@ def add_entry(summary: str, change_type: str = None) -> Optional[str]:
     recorded version), records the summary, syncs PRD.md, and returns the
     new version string.
 
+    The version bump + record happens inside a single locked transaction so
+    two concurrent calls can't compute the same "next version" and collide.
+
     Returns the new version string, or None if summary is empty.
     """
     summary = (summary or "").strip()
     if not summary:
         return None
 
-    new_version = _bump_patch(get_latest_version())
-    if record_version(new_version, summary, change_type):
-        sync_prd_changelog()
-        return new_version
-    return None
+    entry_type = change_type or _classify_change(summary)
+    with _store.transaction() as data:
+        data.setdefault("entries", [])
+        current = data.get("last_recorded_version") or (
+            data["entries"][0]["version"] if data["entries"] else DEFAULT_VERSION
+        )
+        new_version = _bump_patch(current)
+
+        entry = {
+            "version": new_version,
+            "date": datetime.now().isoformat(),
+            "changelog": summary,
+            "type": entry_type,
+        }
+        data["entries"].insert(0, entry)
+        data["last_recorded_version"] = new_version
+
+    sync_prd_changelog()
+    return new_version
 
 
 def sync_prd_changelog() -> bool:

@@ -323,13 +323,24 @@ def scan_webapps() -> List[Dict[str, Any]]:
                     try:
                         content = index_file.read_bytes()
                         title = extract_html_title_description(content)[0] or "index.html"
+                        updates = {}
                         if not meta.get("title"):
+                            updates["title"] = title
                             meta["title"] = title
                         if not meta.get("upload_time"):
                             import time
-                            meta["upload_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
-                        metadata.save_metadata({key: meta} if key not in metadata.load_metadata() else metadata.load_metadata())
-                    except:
+                            updates["upload_time"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+                            meta["upload_time"] = updates["upload_time"]
+                        if updates:
+                            # NOTE: previously this used a buggy one-liner that could
+                            # wipe metadata.json down to a single entry when `key`
+                            # wasn't yet present. touch_file_meta only updates the
+                            # given key's fields and is a no-op if the key is absent
+                            # (a fresh scan-time entry with no upload record yet is
+                            # fine to leave unset here; it gets created properly on
+                            # actual upload).
+                            metadata.touch_file_meta(key, **updates)
+                    except Exception:
                         pass
 
                 title = meta.get("title") or "index.html"
@@ -431,11 +442,11 @@ def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool
         if existing_meta:
             # Update existing metadata — upload_time tracks latest version upload
             # init_upload_time is preserved (first creation time)
-            meta = metadata.load_metadata()
-            meta[key]["upload_time"] = datetime.now().isoformat()
-            meta[key]["uploader_ip"] = uploader_ip
-            # Preserve password and other settings; init_upload_time stays unchanged
-            metadata.save_metadata(meta)
+            metadata.touch_file_meta(
+                key,
+                upload_time=datetime.now().isoformat(),
+                uploader_ip=uploader_ip,
+            )
         else:
             # Save new metadata
             metadata.set_file_meta(
@@ -457,88 +468,84 @@ def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool
         return False, f"上传失败: {str(e)}", ""
 
 
+def _scan_zip_raw_names(zip_bytes: bytes) -> List[Tuple[str, bytes]]:
+    """
+    Scan a ZIP file's raw local file headers to recover (corrected_name,
+    raw_name_bytes) pairs, trying UTF-8/GBK/CP437 in turn. Needed because
+    zipfile's own decoding can garble non-ASCII (e.g. Chinese) filenames
+    depending on which encoding flag the producing tool used.
+    """
+    import struct
+    entries = []
+    pos = 0
+    while pos < len(zip_bytes) - 30:
+        sig = struct.unpack('<I', zip_bytes[pos:pos + 4])[0]
+        if sig != 0x04034b50:
+            pos += 1
+            continue
+        try:
+            fname_len = struct.unpack('<H', zip_bytes[pos + 26:pos + 28])[0]
+            extra_len = struct.unpack('<H', zip_bytes[pos + 28:pos + 30])[0]
+        except struct.error:
+            pos += 1
+            continue
+        fname_start = pos + 30
+        if fname_start + fname_len > len(zip_bytes):
+            break
+        fname_bytes = zip_bytes[fname_start:fname_start + fname_len]
+        corrected = None
+        for enc in ['utf-8', 'gbk', 'cp437']:
+            try:
+                corrected = fname_bytes.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        if corrected is None:
+            corrected = fname_bytes.decode('latin-1', errors='replace')
+        entries.append((corrected, fname_bytes))
+        pos = fname_start + fname_len + extra_len
+    return entries
+
+
+def _build_zip_name_mapping(zip_data: bytes) -> Dict[str, str]:
+    """
+    Build a mapping from "corrected" (properly decoded) entry names to the
+    raw name zipfile.ZipFile actually uses internally, so callers can read
+    entries by their human-readable (correct) name via zf.read(mapping[name]).
+    Shared by extract_zip() (first upload) and extract_zip_for_version()
+    (version update) so both handle Chinese/non-ASCII filenames identically.
+    """
+    import io
+    with zipfile.ZipFile(io.BytesIO(zip_data), "r") as zf:
+        zip_names = [info.filename for info in zf.infolist()]
+
+    name_mapping: Dict[str, str] = {}
+    for corrected_name, raw_bytes in _scan_zip_raw_names(zip_data):
+        for zip_name in zip_names:
+            for enc in ['utf-8', 'gbk', 'cp437', 'latin-1']:
+                try:
+                    if zip_name.encode(enc) == raw_bytes:
+                        name_mapping[corrected_name] = zip_name
+                        break
+                except UnicodeEncodeError:
+                    continue
+            else:
+                continue
+            break
+    return name_mapping
+
+
 def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]]:
     """
     Extract a ZIP file to webapps directory.
     Returns (success, message, list of extracted keys - one key per ZIP project)
     """
     import io
-    import struct
-
-    def try_decode(bytes_data: bytes) -> str:
-        """Try to decode bytes using multiple encodings."""
-        for enc in ['utf-8', 'gbk', 'cp437', 'latin-1']:
-            try:
-                return bytes_data.decode(enc)
-            except:
-                continue
-        return bytes_data.decode('latin-1', errors='replace')
-
-    def scan_zip_raw_names(zip_bytes: bytes) -> List[Tuple[str, str]]:
-        """Scan ZIP raw to get (corrected_name, raw_name) tuples for each file."""
-        # Returns list of tuples: (corrected_utf8_name, raw_name_from_zipfile)
-        entries = []
-        pos = 0
-        while pos < len(zip_bytes) - 30:
-            sig = struct.unpack('<I', zip_bytes[pos:pos+4])[0]
-            if sig != 0x04034b50:
-                pos += 1
-                continue
-            try:
-                fname_len = struct.unpack('<H', zip_bytes[pos+26:pos+28])[0]
-                extra_len = struct.unpack('<H', zip_bytes[pos+28:pos+30])[0]
-            except:
-                pos += 1
-                continue
-            fname_start = pos + 30
-            if fname_start + fname_len > len(zip_bytes):
-                break
-            fname_bytes = zip_bytes[fname_start:fname_start+fname_len]
-            # Try to decode the raw bytes
-            corrected = None
-            for enc in ['utf-8', 'gbk', 'cp437']:
-                try:
-                    corrected = fname_bytes.decode(enc)
-                    break
-                except:
-                    continue
-            if corrected is None:
-                corrected = fname_bytes.decode('latin-1', errors='replace')
-
-            # Now try to find the matching name in ZipFile
-            # We'll build a mapping by comparing encoded forms
-            entries.append((corrected, fname_bytes))
-            pos = fname_start + fname_len + extra_len
-        return entries
 
     try:
-        # Build mapping from corrected UTF-8 names to ZipInfo names
-        with zipfile.ZipFile(io.BytesIO(zip_data), "r") as zf:
-            # Get all ZipInfo entries
-            zip_names = [info.filename for info in zf.infolist()]
-
-        # Scan raw bytes and build mapping from corrected name to zipfile name
-        name_mapping = {}  # corrected_utf8_name -> zipfile_name
-        raw_entries = scan_zip_raw_names(zip_data)
-
-        for corrected_name, raw_bytes in raw_entries:
-            # Try to find the matching zipfile name by encoding the corrected name
-            # with different encodings and comparing bytes
-            for zip_name in zip_names:
-                # zip_name is already decoded by zipfile - it might be garbled
-                # We need to check if encoding zip_name back gives us our raw_bytes
-                try:
-                    # Try to encode the zip_name with different encodings
-                    for enc in ['utf-8', 'gbk', 'cp437', 'latin-1']:
-                        try:
-                            encoded = zip_name.encode(enc)
-                            if encoded == raw_bytes:
-                                name_mapping[corrected_name] = zip_name
-                                break
-                        except:
-                            continue
-                except:
-                    continue
+        # Build mapping from corrected (properly decoded) names to zipfile's
+        # own (possibly garbled) internal names.
+        name_mapping = _build_zip_name_mapping(zip_data)
 
         # Now name_mapping has correct_utf8_name -> zipfile_garbled_name
         # Build the list of all corrected names
@@ -664,90 +671,98 @@ def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]
 
 def extract_zip_for_version(zip_data: bytes, target_filename: str, uploader_ip: str) -> Tuple[bool, str, str]:
     """
-    Extract a ZIP file to webapps directory and update the target file as a new version.
-    Archives the current content before overwriting.
+    Extract a ZIP file and update an existing project as a new version.
+
+    Unlike the old implementation (which only handled the single index.html
+    entry, silently dropping every other file in the ZIP and never archiving
+    them), this now operates on the WHOLE project directory:
+      - For multi-file projects (target_filename like "somedir/index.html"),
+        the entire project directory is archived as a .zip snapshot BEFORE
+        being cleared and replaced with the full contents of the new ZIP.
+        This means resource updates/additions/removals in the new ZIP all
+        take effect, and the historical version can be fully restored later
+        (images/CSS/JS included, not just the HTML).
+      - For single-file root projects (target_filename like "example.html",
+        no directory), behavior is unchanged: only the main HTML entry from
+        the ZIP is used to overwrite the single file, archived the legacy
+        (single-file) way for backward compatibility.
+
     Returns (success, message, key)
     """
-    import io
-    import struct
-
-    def try_decode(bytes_data: bytes) -> str:
-        for enc in ['utf-8', 'gbk', 'cp437', 'latin-1']:
-            try:
-                return bytes_data.decode(enc)
-            except:
-                continue
-        return bytes_data.decode('latin-1', errors='replace')
-
     try:
-        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-            all_names = zf.namelist()
-            all_names = [n for n in all_names if not n.endswith('/')]
+        name_mapping = _build_zip_name_mapping(zip_data)
+        all_names = [k for k in name_mapping.keys()
+                     if not k.endswith('/') and not k.startswith('__MACOSX/')]
+        if not all_names:
+            return False, "ZIP 包内没有文件", ""
 
-            if not all_names:
-                return False, "ZIP 包内没有文件", ""
-
-            # Try to find index.html or the first .html file
-            main_entry = None
+        # Locate the main HTML entry (prefer index.html, else first .html)
+        main_entry = None
+        for name in all_names:
+            if name.lower() == 'index.html' or name.lower().endswith('/index.html'):
+                main_entry = name
+                break
+        if not main_entry:
             for name in all_names:
-                if name.lower() == 'index.html':
+                if name.lower().endswith('.html'):
                     main_entry = name
                     break
-            if not main_entry:
-                for name in all_names:
-                    if name.lower().endswith('.html'):
-                        main_entry = name
-                        break
+        if not main_entry:
+            return False, "未找到 index.html 文件", ""
 
-            if not main_entry:
-                return False, "未找到 index.html 文件", ""
+        key = f"file:{target_filename}"
+        rel_path = Path(target_filename)
+        is_multi_file_project = len(rel_path.parts) > 1
 
-            # Read the main HTML content
-            main_content = zf.read(main_entry)
+        with zipfile.ZipFile(__import__("io").BytesIO(zip_data)) as zf:
+            main_content = zf.read(name_mapping[main_entry])
             title, description = extract_html_title_description(main_content)
 
-            # Get target key
-            key = f"file:{target_filename}"
-
-            # Archive current content if exists (flattened archive name so nested
-            # projects don't require sub-directories under VERSIONS_DIR)
-            current_path = WEBAPPS_DIR / target_filename
-            if current_path.exists():
-                old_content = current_path.read_bytes()
-                old_meta = metadata.get_file_meta(key)
-                prev_version = old_meta.get("current_version", "V1") if old_meta else "V1"
-                _archive_path(target_filename, prev_version).write_bytes(old_content)
-                # Add new version
-                metadata.add_version(key, uploader_ip)
-
-            # Write new content to target path
-            current_path.write_bytes(main_content)
-
-            # Update metadata
-            existing_meta = metadata.get_file_meta(key)
-            if existing_meta:
-                meta = metadata.load_metadata()
-                meta[key]["upload_time"] = datetime.now().isoformat()
-                meta[key]["uploader_ip"] = uploader_ip
-                if not meta[key].get("title") or title:
-                    meta[key]["title"] = title or target_filename
-                if not meta[key].get("description"):
-                    meta[key]["description"] = description or ""
-                metadata.save_metadata(meta)
-            else:
-                product_line = detect_product_line(title or target_filename, description or "")
-                metadata.set_file_meta(
-                    key=key,
-                    title=title or target_filename,
-                    uploader_ip=uploader_ip,
-                    description=description or "",
-                    original_name=target_filename,
-                    product_line=product_line,
+            if is_multi_file_project:
+                # ── Multi-file project: replace the ENTIRE project directory ──
+                project_dir = (WEBAPPS_DIR / rel_path).parent
+                success, msg = _replace_project_directory(
+                    project_dir, key, zf, name_mapping, all_names, main_entry, uploader_ip
                 )
+                if not success:
+                    return False, msg, ""
+            else:
+                # ── Single-file root project: unchanged legacy behavior ──
+                current_path = WEBAPPS_DIR / target_filename
+                if current_path.exists():
+                    old_content = current_path.read_bytes()
+                    old_meta = metadata.get_file_meta(key)
+                    prev_version = old_meta.get("current_version", "V1") if old_meta else "V1"
+                    _archive_path(target_filename, prev_version).write_bytes(old_content)
+                    metadata.add_version(key, uploader_ip)
+                current_path.write_bytes(main_content)
 
-            versions_info = metadata.get_versions(key)
-            current_v = versions_info.get("current_version", "V1")
-            return True, f"已更新为 {current_v} 版本", key
+        # Update metadata (title/description autofill; preserve existing values)
+        existing_meta = metadata.get_file_meta(key)
+        if existing_meta:
+            updates = {
+                "upload_time": datetime.now().isoformat(),
+                "uploader_ip": uploader_ip,
+            }
+            if not existing_meta.get("title") or title:
+                updates["title"] = title or target_filename
+            if not existing_meta.get("description"):
+                updates["description"] = description or ""
+            metadata.touch_file_meta(key, **updates)
+        else:
+            product_line = detect_product_line(title or target_filename, description or "")
+            metadata.set_file_meta(
+                key=key,
+                title=title or target_filename,
+                uploader_ip=uploader_ip,
+                description=description or "",
+                original_name=target_filename,
+                product_line=product_line,
+            )
+
+        versions_info = metadata.get_versions(key)
+        current_v = versions_info.get("current_version", "V1")
+        return True, f"已更新为 {current_v} 版本", key
 
     except zipfile.BadZipFile:
         return False, "无效的 ZIP 文件", ""
@@ -755,16 +770,115 @@ def extract_zip_for_version(zip_data: bytes, target_filename: str, uploader_ip: 
         return False, f"解压失败: {str(e)}", ""
 
 
+def _replace_project_directory(project_dir: Path, key: str, zf: "zipfile.ZipFile",
+                                name_mapping: Dict[str, str], all_names: List[str],
+                                main_entry: str, uploader_ip: str) -> Tuple[bool, str]:
+    """
+    Archive the current project directory as a full .zip snapshot (if it
+    exists), then clear it and write the ENTIRE contents of the new ZIP in
+    its place. Used by extract_zip_for_version() for multi-file projects.
+
+    The new ZIP's internal structure is stripped of its own base folder
+    prefix (if any) the same way extract_zip() does for first-time uploads,
+    so both entry points produce identically-shaped project directories.
+    """
+    filename = str(project_dir.relative_to(WEBAPPS_DIR).as_posix()) + "/index.html"
+
+    # Archive the CURRENT directory content before touching anything, so a
+    # failure partway through extraction never leaves us without a backup.
+    if project_dir.exists() and any(project_dir.iterdir()):
+        old_meta = metadata.get_file_meta(key)
+        prev_version = old_meta.get("current_version", "V1") if old_meta else "V1"
+        try:
+            _zip_directory_to(project_dir, _archive_dir_path(filename, prev_version))
+        except OSError as e:
+            return False, f"归档旧版本失败: {e}"
+        metadata.add_version(key, uploader_ip)
+
+    # Determine the new ZIP's base-folder prefix to strip, mirroring
+    # extract_zip()'s logic: if index.html sits inside a subfolder, that
+    # subfolder is the "project root" and gets stripped; if index.html is at
+    # the ZIP's own root, there's no prefix to strip.
+    if '/' in main_entry:
+        base_prefix = main_entry.rsplit('/', 1)[0] + '/'
+    else:
+        base_prefix = ''
+
+    # Clear the existing directory contents (we already archived them above)
+    # before writing the new ZIP's files, so removed/renamed files in the new
+    # version don't linger as stale leftovers from the old version.
+    if project_dir.exists():
+        shutil.rmtree(project_dir)
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    for corrected_name in all_names:
+        zipfile_name = name_mapping.get(corrected_name)
+        if not zipfile_name:
+            continue
+        clean = corrected_name.lstrip('/')
+        if base_prefix and clean.startswith(base_prefix):
+            entry_rel_path = clean[len(base_prefix):]
+        elif base_prefix:
+            # Entry outside the detected base folder (e.g. stray root files)
+            # — skip to avoid writing outside the project directory.
+            continue
+        else:
+            entry_rel_path = clean
+        if not entry_rel_path:
+            continue
+
+        file_path = project_dir / entry_rel_path
+        try:
+            resolved = file_path.resolve()
+            if not str(resolved).startswith(str(project_dir.resolve())):
+                continue  # Zip Slip protection
+        except (OSError, ValueError):
+            continue
+
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            file_path.write_bytes(zf.read(zipfile_name))
+        except (KeyError, OSError):
+            continue
+
+    return True, "ok"
+
+
+def _delete_all_archives(rel_path: str) -> None:
+    """
+    Remove every historical version archive belonging to a project,
+    covering both the new full-directory zip format and the legacy
+    single-file format. Best-effort: ignores individual file errors so a
+    stray permission issue on one archive doesn't abort the whole delete.
+    """
+    stem = _archive_stem(rel_path)
+    if not VERSIONS_DIR.exists():
+        return
+    for vf in VERSIONS_DIR.iterdir():
+        if vf.is_file() and vf.name.startswith(stem + "__"):
+            try:
+                vf.unlink()
+            except OSError:
+                pass
+
+
 def delete_file(key: str, request_ip: str) -> Tuple[bool, str]:
     """
-    Delete a file if the request IP matches the uploader IP.
+    Delete a project if the request IP matches the uploader IP.
+
+    For multi-file (directory) projects, the ENTIRE project directory is
+    removed (not just index.html) so images/CSS/JS/sub-pages never linger
+    as orphaned files with no way to clean them up. Single-file root
+    projects keep the original behavior of deleting just that one file.
+    All historical version archives for the project are removed as well.
+
     Returns (success, message)
     """
     if not key.startswith("file:"):
         return False, "无效的文件key"
 
-    rel_path = key[5:]  # Remove "file:" prefix
-    file_path = WEBAPPS_DIR / rel_path
+    rel_path_str = key[5:]  # Remove "file:" prefix
+    file_path = WEBAPPS_DIR / rel_path_str
 
     if not file_path.exists():
         return False, "文件不存在"
@@ -779,15 +893,27 @@ def delete_file(key: str, request_ip: str) -> Tuple[bool, str]:
         return False, "无权删除：只能删除自己上传的文件"
 
     try:
-        # Delete the file
-        file_path.unlink()
+        rel_path = Path(rel_path_str)
+        is_multi_file_project = len(rel_path.parts) > 1
 
-        # Remove empty parent directories
-        parent = file_path.parent
-        while parent != WEBAPPS_DIR:
-            if not any(parent.iterdir()):
-                parent.rmdir()
-            parent = parent.parent
+        if is_multi_file_project:
+            # Remove the whole project directory, not just index.html, so
+            # other resources (images/CSS/JS/sub-pages) don't get orphaned
+            # on disk with metadata gone and no way to clean them up.
+            project_dir = file_path.parent
+            shutil.rmtree(project_dir, ignore_errors=True)
+        else:
+            file_path.unlink()
+            # Remove now-empty parent directories, if any (kept for
+            # single-file projects that might sit in a stray empty folder).
+            parent = file_path.parent
+            while parent != WEBAPPS_DIR:
+                if not any(parent.iterdir()):
+                    parent.rmdir()
+                parent = parent.parent
+
+        # Remove all historical version archives (new + legacy formats)
+        _delete_all_archives(rel_path_str)
 
         # Remove metadata
         metadata.remove_file_meta(key)
@@ -811,24 +937,33 @@ def can_delete(key: str, request_ip: str) -> bool:
 
 def update_file_version(key: str, file_data: bytes, uploader_ip: str) -> Tuple[bool, str, str]:
     """
-    Update an EXISTING project with new HTML content as a new version.
+    Update an EXISTING project with new single-HTML content as a new version.
 
     Unlike upload_file(), this preserves the project's real (possibly nested)
     path derived from its key, so subdirectory projects (e.g.
     file:uploaded_x/index.html) are updated in place instead of being written
     to the webapps root.
 
+    For multi-file (directory) projects, uploading via this single-HTML entry
+    point means the user's new version has ONLY that one file — so the whole
+    project directory is archived as a full-directory zip snapshot first
+    (preserving all prior images/CSS/JS for later restore), then the
+    directory is cleared and replaced with just the new index.html. This
+    mirrors extract_zip_for_version()'s directory-replacement semantics and
+    avoids silently leaving stale resources from the previous (multi-file)
+    version lying around next to a now-unrelated single HTML file.
+
     Returns (success, message, key).
     """
     if not key.startswith("file:"):
         return False, "无效的文件key", ""
 
-    rel_path = key[5:]
+    rel_path_str = key[5:]
 
     # Reject path traversal and ensure the resolved target stays inside WEBAPPS_DIR
-    if ".." in rel_path:
+    if ".." in rel_path_str:
         return False, "无效的文件路径", ""
-    dest_path = (WEBAPPS_DIR / rel_path)
+    dest_path = (WEBAPPS_DIR / rel_path_str)
     try:
         resolved = dest_path.resolve()
         resolved.relative_to(WEBAPPS_DIR.resolve())
@@ -840,29 +975,41 @@ def update_file_version(key: str, file_data: bytes, uploader_ip: str) -> Tuple[b
         return False, "文件不存在", ""
 
     try:
-        # Archive current content as the previous version (flattened archive name)
-        old_content = dest_path.read_bytes()
+        rel_path = Path(rel_path_str)
+        is_multi_file_project = len(rel_path.parts) > 1
         old_meta = metadata.get_file_meta(key)
         prev_version = old_meta.get("current_version", "V1") if old_meta else "V1"
-        _archive_path(rel_path, prev_version).write_bytes(old_content)
 
-        # Register the new version and write new content in place
-        metadata.add_version(key, uploader_ip)
-        dest_path.write_bytes(file_data)
+        if is_multi_file_project:
+            # Archive the WHOLE current project directory (not just
+            # index.html) so other resources aren't silently lost.
+            project_dir = dest_path.parent
+            if project_dir.exists() and any(project_dir.iterdir()):
+                _zip_directory_to(project_dir, _archive_dir_path(rel_path_str, prev_version))
+            metadata.add_version(key, uploader_ip)
+            # Clear the directory (old resources are safely archived above)
+            # and write back only the new single HTML file.
+            shutil.rmtree(project_dir, ignore_errors=True)
+            project_dir.mkdir(parents=True, exist_ok=True)
+            dest_path.write_bytes(file_data)
+        else:
+            # Single-file root project — unchanged legacy behavior.
+            old_content = dest_path.read_bytes()
+            _archive_path(rel_path_str, prev_version).write_bytes(old_content)
+            metadata.add_version(key, uploader_ip)
+            dest_path.write_bytes(file_data)
 
         # Refresh metadata (preserve title/description/password/product_line)
         title, description = extract_html_title_description(file_data)
-        meta = metadata.load_metadata()
-        if key in meta:
-            meta[key]["upload_time"] = datetime.now().isoformat()
-            meta[key]["uploader_ip"] = uploader_ip
-            if not meta[key].get("title") and title:
-                meta[key]["title"] = title
-            save = True
-        else:
-            save = False
-        if save:
-            metadata.save_metadata(meta)
+        current_meta = metadata.get_file_meta(key)
+        if current_meta is not None:
+            updates = {
+                "upload_time": datetime.now().isoformat(),
+                "uploader_ip": uploader_ip,
+            }
+            if not current_meta.get("title") and title:
+                updates["title"] = title
+            metadata.touch_file_meta(key, **updates)
 
         versions_info = metadata.get_versions(key)
         current_v = versions_info.get("current_version", "V1")
@@ -886,32 +1033,102 @@ def _archive_stem(filename: str) -> str:
 
 
 def _archive_path(filename: str, version: str) -> Path:
-    """Return the VERSIONS_DIR path for a given file/version archive."""
+    """Return the VERSIONS_DIR path for a given file/version archive
+    (legacy single-file format — one HTML file only)."""
     return VERSIONS_DIR / f"{_archive_stem(filename)}__{version}"
+
+
+def _archive_dir_path(filename: str, version: str) -> Path:
+    """
+    Return the VERSIONS_DIR path for a directory-project archive: a .zip
+    snapshot of the ENTIRE project folder (index.html + all images/CSS/JS/
+    sub-pages), used for multi-file ZIP-uploaded projects so version
+    upgrades never silently drop or leave stale any non-index.html resource.
+    """
+    return VERSIONS_DIR / f"{_archive_stem(filename)}__{version}.zip"
+
+
+def _zip_directory_to(src_dir: Path, zip_path: Path) -> None:
+    """Zip up the entire contents of src_dir (relative paths preserved,
+    only regular files) into zip_path."""
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in sorted(src_dir.rglob("*")):
+            if file_path.is_file():
+                zf.write(file_path, file_path.relative_to(src_dir).as_posix())
+
+
+def is_directory_version(filename: str, version: str) -> bool:
+    """Check whether a historical version was archived as a full-directory
+    zip snapshot (new format) rather than a single-file archive (legacy)."""
+    return _archive_dir_path(filename, version).exists()
 
 
 def get_version_content(filename: str, version: str) -> Optional[bytes]:
     """
-    Get the content of a historical version file.
+    Get the main HTML content of a historical version.
+    Supports both:
+      - the new full-directory zip archive format (multi-file projects):
+        extracts the index.html entry from the snapshot
+      - the legacy single-file archive format (root .html projects, and any
+        pre-fix multi-file archives that only ever stored the main HTML)
     Returns bytes if found, None if not found.
     """
-    # Try flattened archive name first (current scheme)
+    # New format: directory zip snapshot -> extract its index.html
+    dir_zip = _archive_dir_path(filename, version)
+    if dir_zip.exists():
+        try:
+            with zipfile.ZipFile(dir_zip) as zf:
+                basename = Path(filename).name
+                if basename in zf.namelist():
+                    return zf.read(basename)
+                for name in zf.namelist():
+                    if '/' not in name and name.lower().endswith('.html'):
+                        return zf.read(name)
+        except (zipfile.BadZipFile, KeyError, OSError):
+            pass
+
+    # Legacy single-file format
     version_path = _archive_path(filename, version)
     if version_path.exists():
         return version_path.read_bytes()
 
-    # Backward-compat: legacy archives that kept the raw filename
     legacy_path = VERSIONS_DIR / f"{filename}__{version}"
     if legacy_path.exists():
         return legacy_path.read_bytes()
 
-    # Fallback: match by flattened stem prefix + version suffix
     stem = _archive_stem(filename)
     for vf in VERSIONS_DIR.iterdir():
-        if vf.name.startswith(stem) and vf.name.endswith(f"__{version}"):
+        if vf.is_file() and vf.name.startswith(stem) and vf.name.endswith(f"__{version}"):
             return vf.read_bytes()
 
     return None
+
+
+def get_version_subresource(filename: str, version: str, subpath: str) -> Optional[bytes]:
+    """
+    Get a sub-resource (image/CSS/JS/sub-page) from a historical
+    full-directory version archive.
+
+    Returns None if:
+      - the requested version wasn't archived in the new directory format
+        (legacy single-file archives never had sub-resources to begin with,
+        so there is nothing to serve — this is expected, not an error), or
+      - the subpath doesn't exist within the archive.
+    """
+    if not subpath or '..' in subpath:
+        return None
+    dir_zip = _archive_dir_path(filename, version)
+    if not dir_zip.exists():
+        return None
+    try:
+        with zipfile.ZipFile(dir_zip) as zf:
+            try:
+                return zf.read(subpath)
+            except KeyError:
+                return None
+    except (zipfile.BadZipFile, OSError):
+        return None
 
 
 def get_current_content(filename: str) -> Optional[bytes]:
@@ -925,31 +1142,63 @@ def get_current_content(filename: str) -> Optional[bytes]:
 def restore_version_file(key: str, version: str, request_ip: str) -> Tuple[bool, str]:
     """
     Restore a historical version as the current version.
+
+    For multi-file (directory) projects whose target version was archived
+    in the new full-directory format, this restores the ENTIRE directory
+    snapshot (all images/CSS/JS/sub-pages), not just index.html — so the
+    restored project is fully self-consistent instead of mixing an old
+    index.html with newer leftover resources.
+
     Returns (success, message).
     """
-    # Check permission
     if not can_delete(key, request_ip):
         return False, "无权恢复此版本"
 
-    # Get filename from key
     filename = key[5:] if key.startswith("file:") else key
+    rel_path = Path(filename)
+    is_multi_file_project = len(rel_path.parts) > 1
+    project_dir = (WEBAPPS_DIR / rel_path).parent if is_multi_file_project else None
 
-    # Get historical version content
-    content = get_version_content(filename, version)
-
-    # Archive current content as the previous version
     current_meta = metadata.get_file_meta(key)
-    if current_meta:
-        current_content = get_current_content(filename)
-        if current_content:
-            current_v = current_meta.get("current_version", "V1")
-            _archive_path(filename, current_v).write_bytes(current_content)
-        # Update metadata
+    if not current_meta:
+        return False, "文件不存在"
+    current_v = current_meta.get("current_version", "V1")
+
+    if is_multi_file_project and is_directory_version(filename, version):
+        # ── Full-directory restore ──
+        # Archive the CURRENT directory before overwriting it.
+        if project_dir.exists() and any(project_dir.iterdir()):
+            try:
+                _zip_directory_to(project_dir, _archive_dir_path(filename, current_v))
+            except OSError as e:
+                return False, f"归档当前版本失败: {e}"
+
+        dir_zip = _archive_dir_path(filename, version)
+        try:
+            shutil.rmtree(project_dir, ignore_errors=True)
+            project_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(dir_zip) as zf:
+                zf.extractall(project_dir)
+        except (zipfile.BadZipFile, OSError) as e:
+            return False, f"恢复版本失败: {e}"
+
         ok, msg = metadata.restore_version(key, version)
         if not ok:
             return False, msg
+        return True, f"已恢复为 {version} 版本"
 
-    # If historical version has physical file, write it to current path
+    # ── Legacy single-file restore (root projects, or old archives that
+    #    predate the directory-format fix) ──
+    content = get_version_content(filename, version)
+
+    current_content = get_current_content(filename)
+    if current_content:
+        _archive_path(filename, current_v).write_bytes(current_content)
+
+    ok, msg = metadata.restore_version(key, version)
+    if not ok:
+        return False, msg
+
     if content is not None:
         file_path = WEBAPPS_DIR / filename
         file_path.write_bytes(content)
@@ -959,7 +1208,8 @@ def restore_version_file(key: str, version: str, request_ip: str) -> Tuple[bool,
 
 def delete_version_file(key: str, version: str, request_ip: str) -> Tuple[bool, str]:
     """
-    Delete a historical version file.
+    Delete a historical version's archive (new directory-zip format or
+    legacy single-file format, whichever exists).
     Returns (success, message).
     """
     # Check permission
@@ -969,7 +1219,16 @@ def delete_version_file(key: str, version: str, request_ip: str) -> Tuple[bool, 
     # Get filename from key
     filename = key[5:] if key.startswith("file:") else key
 
-    # Find and delete the version file (flattened archive name)
+    # New format: full-directory zip snapshot
+    dir_zip = _archive_dir_path(filename, version)
+    if dir_zip.exists():
+        try:
+            dir_zip.unlink()
+        except OSError as e:
+            return False, f"删除版本文件失败: {str(e)}"
+        return metadata.delete_version(key, version)
+
+    # Legacy format: flattened single-file archive
     version_path = _archive_path(filename, version)
 
     # Fall back to legacy raw-name archive, then prefix match
@@ -980,7 +1239,7 @@ def delete_version_file(key: str, version: str, request_ip: str) -> Tuple[bool, 
         else:
             stem = _archive_stem(filename)
             for vf in VERSIONS_DIR.iterdir():
-                if vf.name.startswith(stem) and vf.name.endswith(f"__{version}"):
+                if vf.is_file() and vf.name.startswith(stem) and vf.name.endswith(f"__{version}"):
                     version_path = vf
                     break
 

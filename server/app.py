@@ -859,6 +859,25 @@ def create_app():
         assets_dir = Path(__file__).parent / "templates" / "assets"
         return send_from_directory(assets_dir, filename)
 
+    def _inject_base_href(content: bytes, filename: str, version: str) -> bytes:
+        """
+        Inject a <base href> pointing at the version's sub-resource route so
+        relative paths in the historical HTML (images/css/js/sub-pages)
+        resolve correctly instead of 404ing. Without this, the browser would
+        resolve e.g. "images/foo.png" relative to the current
+        /versions/<filename>/<version> URL, which doesn't match any route.
+        Harmless no-op for single-file projects with no relative resources.
+        """
+        import re as _re
+        from urllib.parse import quote
+        safe_filename = quote(filename, safe="/")
+        base_tag = f'<base href="/versions/{safe_filename}/{version}/res/">'.encode("utf-8")
+        match = _re.search(rb'<head[^>]*>', content, _re.IGNORECASE)
+        if match:
+            insert_at = match.end()
+            return content[:insert_at] + base_tag + content[insert_at:]
+        return base_tag + content
+
     @app.route("/versions/<path:filename>/<version>")
     def serve_version(filename, version):
         """Serve a historical version of a file."""
@@ -888,7 +907,8 @@ def create_app():
         content = file_manager.get_version_content(filename, version)
         if content is not None:
             audit_access(key, detail=f"历史版本 {version}")
-            return content, 200, {"Content-Type": "text/html; charset=utf-8"}
+            html = _inject_base_href(content, filename, version)
+            return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
         # Fall back to current version
         content = file_manager.get_current_content(filename)
@@ -897,6 +917,22 @@ def create_app():
             return content, 200, {"Content-Type": "text/html; charset=utf-8"}
 
         return "文件不存在", 404
+
+    @app.route("/versions/<path:filename>/<version>/res/<path:subpath>")
+    def serve_version_subresource(filename, version, subpath):
+        """
+        Serve a sub-resource (image/CSS/JS/sub-page) from a historical
+        full-directory version archive, so previewing an old version of a
+        multi-file project renders correctly instead of showing broken
+        images/styles. Legacy single-file archives have no sub-resources by
+        definition, so a 404 here for those is expected, not a bug.
+        """
+        content = file_manager.get_version_subresource(filename, version, subpath)
+        if content is None:
+            return "资源不存在", 404
+        import mimetypes
+        mime_type = mimetypes.guess_type(subpath)[0] or "application/octet-stream"
+        return content, 200, {"Content-Type": mime_type}
 
     # ── SPA Fallback ─────────────────────────────────────────────────────────────
 

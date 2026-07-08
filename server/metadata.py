@@ -46,8 +46,13 @@ _server_dir = Path(__file__).parent.resolve()
 sys.path.insert(0, str(_server_dir))
 
 from config import METADATA_FILE
+from atomic_store import AtomicJSONStore
 
 ADMIN_KEY = "_system_admins_"
+
+# Single shared store instance: atomic writes, auto-backup, corruption
+# recovery, and cross-process file locking for read-modify-write cycles.
+_store = AtomicJSONStore(METADATA_FILE, empty_default={})
 
 # bcrypt salt rounds (cost factor 12 = ~250ms per hash on modern hardware)
 BCRYPT_ROUNDS = 12
@@ -78,6 +83,7 @@ def _verify_password_legacy(password: str, password_hash: str) -> bool:
 
 def verify_admin_password(username: str, password: str) -> bool:
     """Verify admin username and password. Supports both bcrypt and legacy SHA256."""
+    # Fast path: pure read, no lock needed.
     meta = load_metadata()
     if ADMIN_KEY not in meta:
         return False
@@ -89,17 +95,19 @@ def verify_admin_password(username: str, password: str) -> bool:
         if not stored_hash:
             continue
 
-        # New bcrypt hash
         if _is_bcrypt_hash(stored_hash):
             if _verify_password_bcrypt(password, stored_hash):
                 return True
         else:
-            # Legacy SHA256 hash — verify and upgrade to bcrypt
+            # Legacy SHA256 hash — verify, then upgrade to bcrypt under lock.
             if _verify_password_legacy(password, stored_hash):
-                # Upgrade: re-hash with bcrypt and save
                 new_hash = _hash_password_bcrypt(password)
-                user["password_hash"] = new_hash
-                save_metadata(meta)
+                with _store.transaction() as tx_meta:
+                    if ADMIN_KEY in tx_meta:
+                        for tx_user in tx_meta[ADMIN_KEY]["users"]:
+                            if tx_user["username"] == username:
+                                tx_user["password_hash"] = new_hash
+                                break
                 return True
     return False
 
@@ -110,21 +118,13 @@ def hash_admin_password(password: str) -> str:
 
 
 def load_metadata() -> Dict[str, Any]:
-    """Load metadata from JSON file."""
-    if not METADATA_FILE.exists():
-        return {}
-    try:
-        return json.loads(METADATA_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, IOError):
-        return {}
+    """Load metadata from JSON file (atomic, self-healing on corruption)."""
+    return _store.load()
 
 
 def save_metadata(data: Dict[str, Any]) -> None:
-    """Save metadata to JSON file."""
-    METADATA_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+    """Save metadata to JSON file (atomic write with automatic backup)."""
+    _store.save(data)
 
 
 def get_file_meta(key: str) -> Optional[Dict[str, Any]]:
@@ -137,22 +137,20 @@ def update_file_meta(key: str, title: str = None, description: str = None, produ
     """Update title, description, product_line, and/or password for a file.
     Password is stored as bcrypt hash, not plain text.
     """
-    meta = load_metadata()
-    if key not in meta:
-        meta[key] = {}
-    if title is not None:
-        meta[key]["title"] = title
-    if description is not None:
-        meta[key]["description"] = description
-    if product_line is not None:
-        meta[key]["product_line"] = product_line
-    if password is not None:
-        # Store bcrypt hash, not plain text
-        if password:
-            meta[key]["password"] = _hash_password_bcrypt(password)
-        else:
-            meta[key]["password"] = None
-    save_metadata(meta)
+    with _store.transaction() as meta:
+        if key not in meta:
+            meta[key] = {}
+        if title is not None:
+            meta[key]["title"] = title
+        if description is not None:
+            meta[key]["description"] = description
+        if product_line is not None:
+            meta[key]["product_line"] = product_line
+        if password is not None:
+            if password:
+                meta[key]["password"] = _hash_password_bcrypt(password)
+            else:
+                meta[key]["password"] = None
 
 
 # ── Version Management ────────────────────────────────────────────────────────
@@ -162,19 +160,18 @@ def init_versions(key: str, uploader_ip: str) -> str:
     Initialize the versions dict for a file when first uploaded.
     Returns the first version string 'V1'.
     """
-    meta = load_metadata()
-    if key not in meta:
-        meta[key] = {}
-    if "versions" not in meta[key]:
-        meta[key]["versions"] = {}
-    if "current_version" not in meta[key]:
-        meta[key]["current_version"] = "V1"
-        meta[key]["versions"]["V1"] = {
-            "upload_time": meta[key].get("upload_time", datetime.now().isoformat()),
-            "uploader_ip": uploader_ip or meta[key].get("uploader_ip", ""),
-        }
-        save_metadata(meta)
-    return meta[key]["current_version"]
+    with _store.transaction() as meta:
+        if key not in meta:
+            meta[key] = {}
+        if "versions" not in meta[key]:
+            meta[key]["versions"] = {}
+        if "current_version" not in meta[key]:
+            meta[key]["current_version"] = "V1"
+            meta[key]["versions"]["V1"] = {
+                "upload_time": meta[key].get("upload_time", datetime.now().isoformat()),
+                "uploader_ip": uploader_ip or meta[key].get("uploader_ip", ""),
+            }
+        return meta[key]["current_version"]
 
 
 def add_version(key: str, uploader_ip: str) -> str:
@@ -182,36 +179,33 @@ def add_version(key: str, uploader_ip: str) -> str:
     Add a new version entry for an existing file.
     Returns the new version string (e.g. 'V4').
     """
-    meta = load_metadata()
-    if key not in meta:
-        return ""
-    if "versions" not in meta[key]:
-        meta[key]["versions"] = {}
-    if "current_version" not in meta[key]:
-        meta[key]["current_version"] = "V1"
-        meta[key]["versions"]["V1"] = {
+    with _store.transaction() as meta:
+        if key not in meta:
+            return ""
+        if "versions" not in meta[key]:
+            meta[key]["versions"] = {}
+        if "current_version" not in meta[key]:
+            meta[key]["current_version"] = "V1"
+            meta[key]["versions"]["V1"] = {
+                "upload_time": datetime.now().isoformat(),
+                "uploader_ip": uploader_ip,
+            }
+            return "V1"
+
+        # Increment version number
+        current = meta[key]["current_version"]
+        try:
+            current_num = int(current[1:])
+        except (ValueError, IndexError):
+            current_num = 1
+
+        new_version = f"V{current_num + 1}"
+        meta[key]["current_version"] = new_version
+        meta[key]["versions"][new_version] = {
             "upload_time": datetime.now().isoformat(),
             "uploader_ip": uploader_ip,
         }
-        save_metadata(meta)
-        return "V1"
-
-    # Increment version number
-    current = meta[key]["current_version"]
-    # Parse version number from "V3" -> 3
-    try:
-        current_num = int(current[1:])
-    except:
-        current_num = 1
-
-    new_version = f"V{current_num + 1}"
-    meta[key]["current_version"] = new_version
-    meta[key]["versions"][new_version] = {
-        "upload_time": datetime.now().isoformat(),
-        "uploader_ip": uploader_ip,
-    }
-    save_metadata(meta)
-    return new_version
+        return new_version
 
 
 def get_versions(key: str) -> Dict[str, Any]:
@@ -223,11 +217,13 @@ def get_versions(key: str) -> Dict[str, Any]:
     versions = file_meta.get("versions", {})
     # Backward compatibility: if versions is empty but file exists, initialize
     if not versions and file_meta.get("upload_time"):
-        versions = {"V1": {"upload_time": file_meta.get("upload_time", datetime.now().isoformat()), "uploader_ip": file_meta.get("uploader_ip", "")}}
-        current = file_meta.get("current_version", "V1")
-        file_meta["versions"] = versions
-        file_meta["current_version"] = current or "V1"
-        save_metadata(meta)
+        with _store.transaction() as tx_meta:
+            if key in tx_meta:
+                tx_file_meta = tx_meta[key]
+                versions = {"V1": {"upload_time": tx_file_meta.get("upload_time", datetime.now().isoformat()), "uploader_ip": tx_file_meta.get("uploader_ip", "")}}
+                current = tx_file_meta.get("current_version", "V1")
+                tx_file_meta["versions"] = versions
+                tx_file_meta["current_version"] = current or "V1"
     return {
         "current_version": file_meta.get("current_version", "V1"),
         "versions": versions,
@@ -248,15 +244,14 @@ def restore_version(key: str, version: str) -> Tuple[bool, str]:
     Restore a historical version as the current version.
     Returns (success, message).
     """
-    meta = load_metadata()
-    if key not in meta:
-        return False, "文件不存在"
-    versions = meta[key].get("versions", {})
-    if version not in versions:
-        return False, f"版本 {version} 不存在"
-    meta[key]["current_version"] = version
-    save_metadata(meta)
-    return True, f"已恢复为 {version}"
+    with _store.transaction() as meta:
+        if key not in meta:
+            return False, "文件不存在"
+        versions = meta[key].get("versions", {})
+        if version not in versions:
+            return False, f"版本 {version} 不存在"
+        meta[key]["current_version"] = version
+        return True, f"已恢复为 {version}"
 
 
 def delete_version(key: str, version: str) -> Tuple[bool, str]:
@@ -264,18 +259,17 @@ def delete_version(key: str, version: str) -> Tuple[bool, str]:
     Delete a historical version (cannot delete current version).
     Returns (success, message).
     """
-    meta = load_metadata()
-    if key not in meta:
-        return False, "文件不存在"
-    versions = meta[key].get("versions", {})
-    current = meta[key].get("current_version", "V1")
-    if version == current:
-        return False, "不能删除当前版本"
-    if version not in versions:
-        return False, f"版本 {version} 不存在"
-    del versions[version]
-    save_metadata(meta)
-    return True, f"已删除 {version}"
+    with _store.transaction() as meta:
+        if key not in meta:
+            return False, "文件不存在"
+        versions = meta[key].get("versions", {})
+        current = meta[key].get("current_version", "V1")
+        if version == current:
+            return False, "不能删除当前版本"
+        if version not in versions:
+            return False, f"版本 {version} 不存在"
+        del versions[version]
+        return True, f"已删除 {version}"
 
 
 def set_file_meta(
@@ -289,42 +283,54 @@ def set_file_meta(
     password: str = None
 ) -> None:
     """Set complete metadata for a file (used on upload)."""
-    meta = load_metadata()
-    meta[key] = {
-        "title": title,
-        "description": description,
-        "uploader_ip": uploader_ip,
-        "upload_time": datetime.now().isoformat(),
-        "original_name": original_name,
-    }
-    if parent_key:
-        meta[key]["parent_key"] = parent_key
-    if product_line:
-        meta[key]["product_line"] = product_line
-    if password is not None:
-        meta[key]["password"] = _hash_password_bcrypt(password) if password else None
-    # init_upload_time is set only on first upload, never changed
-    if "init_upload_time" not in meta[key]:
-        meta[key]["init_upload_time"] = datetime.now().isoformat()
-    # Initialize version tracking
-    meta[key]["current_version"] = "V1"
-    meta[key]["versions"] = {
-        "V1": {
-            "upload_time": datetime.now().isoformat(),
+    with _store.transaction() as meta:
+        meta[key] = {
+            "title": title,
+            "description": description,
             "uploader_ip": uploader_ip,
+            "upload_time": datetime.now().isoformat(),
+            "original_name": original_name,
         }
-    }
-    save_metadata(meta)
+        if parent_key:
+            meta[key]["parent_key"] = parent_key
+        if product_line:
+            meta[key]["product_line"] = product_line
+        if password is not None:
+            meta[key]["password"] = _hash_password_bcrypt(password) if password else None
+        # init_upload_time is set only on first upload, never changed
+        if "init_upload_time" not in meta[key]:
+            meta[key]["init_upload_time"] = datetime.now().isoformat()
+        # Initialize version tracking
+        meta[key]["current_version"] = "V1"
+        meta[key]["versions"] = {
+            "V1": {
+                "upload_time": datetime.now().isoformat(),
+                "uploader_ip": uploader_ip,
+            }
+        }
+
+
+def touch_file_meta(key: str, **fields) -> bool:
+    """
+    Atomically update arbitrary fields on an existing file's metadata entry
+    under a single locked transaction (avoids the load/mutate/save races
+    that direct load_metadata()/save_metadata() call pairs used to have).
+    Returns True if the key existed and was updated, False otherwise.
+    """
+    with _store.transaction() as meta:
+        if key not in meta:
+            return False
+        meta[key].update(fields)
+        return True
 
 
 def remove_file_meta(key: str) -> bool:
     """Remove metadata for a file. Returns True if existed."""
-    meta = load_metadata()
-    if key in meta:
-        del meta[key]
-        save_metadata(meta)
-        return True
-    return False
+    with _store.transaction() as meta:
+        if key in meta:
+            del meta[key]
+            return True
+        return False
 
 
 def file_exists(key: str) -> bool:
@@ -344,8 +350,10 @@ def check_file_password(key: str, password: str) -> bool:
     if not _is_bcrypt_hash(stored_hash):
         # Legacy plain-text password — upgrade to bcrypt on successful match
         if stored_hash == password:
-            meta[key]["password"] = _hash_password_bcrypt(password)
-            save_metadata(meta)
+            new_hash = _hash_password_bcrypt(password)
+            with _store.transaction() as tx_meta:
+                if key in tx_meta:
+                    tx_meta[key]["password"] = new_hash
             return True
         return False
     return _verify_password_bcrypt(password, stored_hash)
@@ -361,14 +369,13 @@ def has_password(key: str) -> bool:
 
 def set_file_password(key: str, password: str) -> None:
     """Set or update a file's password (stores bcrypt hash, not plain text)."""
-    meta = load_metadata()
-    if key not in meta:
-        meta[key] = {}
-    if password:
-        meta[key]["password"] = _hash_password_bcrypt(password)
-    else:
-        meta[key]["password"] = None
-    save_metadata(meta)
+    with _store.transaction() as meta:
+        if key not in meta:
+            meta[key] = {}
+        if password:
+            meta[key]["password"] = _hash_password_bcrypt(password)
+        else:
+            meta[key]["password"] = None
 
 
 def migrate_file_passwords() -> Dict[str, Any]:
@@ -376,18 +383,16 @@ def migrate_file_passwords() -> Dict[str, Any]:
     Migrate all plain-text file passwords to bcrypt.
     Returns a report of migrations performed.
     """
-    meta = load_metadata()
-    migrated = []
-    for key, data in meta.items():
-        if key.startswith(ADMIN_KEY):
-            continue
-        pw = data.get("password")
-        if pw and not _is_bcrypt_hash(pw):
-            data["password"] = _hash_password_bcrypt(pw)
-            migrated.append(key)
-    if migrated:
-        save_metadata(meta)
-    return {"migrated": migrated, "count": len(migrated)}
+    with _store.transaction() as meta:
+        migrated = []
+        for key, data in meta.items():
+            if key.startswith(ADMIN_KEY):
+                continue
+            pw = data.get("password")
+            if pw and not _is_bcrypt_hash(pw):
+                data["password"] = _hash_password_bcrypt(pw)
+                migrated.append(key)
+        return {"migrated": migrated, "count": len(migrated)}
 
 
 # ── Admin Management ──────────────────────────────────────────────────────────
@@ -405,54 +410,47 @@ def add_admin(username: str, password_hash: str, force_password_change: bool = F
     password_hash should already be bcrypt-hashed via hash_admin_password().
     If force_password_change is True, the admin must change their password on next login.
     """
-    meta = load_metadata()
-    if ADMIN_KEY not in meta:
-        meta[ADMIN_KEY] = {"users": []}
+    with _store.transaction() as meta:
+        if ADMIN_KEY not in meta:
+            meta[ADMIN_KEY] = {"users": []}
 
-    # Check if username already exists
-    for user in meta[ADMIN_KEY]["users"]:
-        if user["username"] == username:
-            return False
+        for user in meta[ADMIN_KEY]["users"]:
+            if user["username"] == username:
+                return False
 
-    meta[ADMIN_KEY]["users"].append({
-        "username": username,
-        "password_hash": password_hash,
-        "created_at": datetime.now().isoformat(),
-        "force_password_change": force_password_change,
-    })
-    save_metadata(meta)
-    return True
+        meta[ADMIN_KEY]["users"].append({
+            "username": username,
+            "password_hash": password_hash,
+            "created_at": datetime.now().isoformat(),
+            "force_password_change": force_password_change,
+        })
+        return True
 
 
 def remove_admin(username: str) -> bool:
     """Remove an admin user. Returns True if removed, False if not found."""
-    meta = load_metadata()
-    if ADMIN_KEY not in meta:
-        return False
+    with _store.transaction() as meta:
+        if ADMIN_KEY not in meta:
+            return False
 
-    original_len = len(meta[ADMIN_KEY]["users"])
-    meta[ADMIN_KEY]["users"] = [
-        u for u in meta[ADMIN_KEY]["users"] if u["username"] != username
-    ]
-
-    if len(meta[ADMIN_KEY]["users"]) < original_len:
-        save_metadata(meta)
-        return True
-    return False
+        original_len = len(meta[ADMIN_KEY]["users"])
+        meta[ADMIN_KEY]["users"] = [
+            u for u in meta[ADMIN_KEY]["users"] if u["username"] != username
+        ]
+        return len(meta[ADMIN_KEY]["users"]) < original_len
 
 
 def update_admin_password(username: str, new_password_hash: str) -> bool:
     """Update admin password. Returns True if updated. new_password_hash should be bcrypt-hashed."""
-    meta = load_metadata()
-    if ADMIN_KEY not in meta:
-        return False
+    with _store.transaction() as meta:
+        if ADMIN_KEY not in meta:
+            return False
 
-    for user in meta[ADMIN_KEY]["users"]:
-        if user["username"] == username:
-            user["password_hash"] = new_password_hash
-            save_metadata(meta)
-            return True
-    return False
+        for user in meta[ADMIN_KEY]["users"]:
+            if user["username"] == username:
+                user["password_hash"] = new_password_hash
+                return True
+        return False
 
 
 def is_super_admin(username: str) -> bool:
@@ -476,14 +474,11 @@ def must_change_password(username: str) -> bool:
 
 def clear_force_password_change(username: str) -> bool:
     """Clear the force_password_change flag for an admin."""
-    meta = load_metadata()
-    if ADMIN_KEY not in meta:
-        return False
-    for user in meta[ADMIN_KEY]["users"]:
-        if user["username"] == username:
-            if user.get("force_password_change"):
+    with _store.transaction() as meta:
+        if ADMIN_KEY not in meta:
+            return False
+        for user in meta[ADMIN_KEY]["users"]:
+            if user["username"] == username:
                 user["force_password_change"] = False
-                save_metadata(meta)
                 return True
-            return True  # Already false, consider it cleared
-    return False
+        return False
