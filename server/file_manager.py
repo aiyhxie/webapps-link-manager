@@ -49,6 +49,7 @@ def safe_filename(raw_name: str) -> str:
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
+from urllib.parse import quote
 
 # Add server directory to path for imports
 _server_dir = Path(__file__).parent.resolve()
@@ -300,7 +301,10 @@ def scan_webapps() -> List[Dict[str, Any]]:
                     or meta.get("upload_time")
                 ),
                 "isDir": False,
-                "url": f"/protected/{item.name}" if has_password else f"/files/{item.name}",
+                # URL-encode the path (Chinese/non-ASCII chars) so the copied
+                # link is recognized by IM tools like WeCom, which fail to
+                # detect raw non-ASCII URLs when forwarding messages.
+                "url": f"/protected/{quote(item.name)}" if has_password else f"/files/{quote(item.name)}",
                 "productLine": product_line,
                 "hasPassword": has_password,
                 "currentVersion": current_version,
@@ -380,7 +384,9 @@ def scan_webapps() -> List[Dict[str, Any]]:
                         or meta.get("upload_time")
                     ),
                     "isDir": False,
-                    "url": f"/protected/{rel_path.as_posix()}" if has_password else f"/files/{rel_path.as_posix()}",
+                    # URL-encode the path (Chinese/non-ASCII chars) so the
+                    # copied link is recognized by IM tools like WeCom.
+                    "url": f"/protected/{quote(rel_path.as_posix())}" if has_password else f"/files/{quote(rel_path.as_posix())}",
                     "productLine": product_line,
                     "hasPassword": has_password,
                     "currentVersion": current_version,
