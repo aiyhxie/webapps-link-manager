@@ -17,11 +17,13 @@
  * - components/PasswordModal.tsx: 设置/修改密码弹窗
  */
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { ConfigProvider, Layout, Typography, message, Input, Button, Space, Card, Empty, Tooltip, Popconfirm, Drawer, Badge, Dropdown, MenuProps, Modal, Form } from 'antd';
-import { SearchOutlined, CopyOutlined, EditOutlined, DeleteOutlined, DesktopOutlined, GlobalOutlined, MenuOutlined, AppstoreOutlined, SunOutlined, MoonOutlined, MoreOutlined, PlusOutlined, CheckOutlined, LockOutlined, UnlockOutlined, InboxOutlined, UserOutlined, LogoutOutlined, TeamOutlined } from '@ant-design/icons';
+import { ConfigProvider, Layout, Typography, message, Input, Button, Space, Card, Empty, Tooltip, Popconfirm, Drawer, Badge, Dropdown, MenuProps, Form } from 'antd';
+import { SearchOutlined, CopyOutlined, EditOutlined, DeleteOutlined, DesktopOutlined, GlobalOutlined, MenuOutlined, AppstoreOutlined, SunOutlined, MoonOutlined, MoreOutlined, PlusOutlined, CheckOutlined, LockOutlined, UnlockOutlined, InboxOutlined, UserOutlined, LogoutOutlined, TeamOutlined, KeyOutlined, FileTextOutlined, DownOutlined } from '@ant-design/icons';
 import EditModal from './components/EditModal';
 import PasswordModal from './components/PasswordModal';
 import ChangelogModal from './components/ChangelogModal';
+import LogsDrawer from './components/LogsDrawer';
+import ChangePasswordDrawer from './components/ChangePasswordDrawer';
 import type { FileInfo, ChangelogEntry } from './types';
 import { PRODUCT_LINES } from './types';
 import { api, setAdminToken, clearAdminToken } from './api';
@@ -104,6 +106,8 @@ function App() {
   const [adminLoginVisible, setAdminLoginVisible] = useState(false);
   const [adminManageVisible, setAdminManageVisible] = useState(false);
   const [adminSetupVisible, setAdminSetupVisible] = useState(false);
+  const [logsVisible, setLogsVisible] = useState(false);
+  const [changePasswordVisible, setChangePasswordVisible] = useState(false);
   const [adminLoginForm] = Form.useForm();
   const [adminSetupForm] = Form.useForm();
 
@@ -811,12 +815,34 @@ function App() {
                 )}
                 <Button
                   type="text"
-                  style={{ color: textSecondary, height: 36, padding: '0 12px', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 6 }}
-                  onClick={handleAdminLogout}
+                  style={{ color: textColor, height: 36, padding: '0 12px', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 6 }}
+                  onClick={() => setLogsVisible(true)}
                 >
-                  <LogoutOutlined />
-                  {adminUsername}
+                  <FileTextOutlined />
+                  系统日志
                 </Button>
+                <Dropdown
+                  menu={{
+                    items: [
+                      { key: 'changePassword', label: '修改密码', icon: <KeyOutlined /> },
+                      { key: 'logout', label: '退出登录', icon: <LogoutOutlined /> },
+                    ],
+                    onClick: ({ key }) => {
+                      if (key === 'changePassword') setChangePasswordVisible(true);
+                      else if (key === 'logout') handleAdminLogout();
+                    },
+                  }}
+                  trigger={['click']}
+                >
+                  <Button
+                    type="text"
+                    style={{ color: textSecondary, height: 36, padding: '0 12px', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 6 }}
+                  >
+                    <UserOutlined />
+                    {adminUsername}
+                    <DownOutlined style={{ fontSize: 10 }} />
+                  </Button>
+                </Dropdown>
               </>
             ) : (
               <Button
@@ -1362,12 +1388,12 @@ function App() {
         onClose={() => setChangelogVisible(false)}
       />
 
-      {/* Admin Login Modal */}
-      <Modal
+      {/* Admin Login Drawer */}
+      <Drawer
         title="管理员登录"
         open={adminLoginVisible}
-        onCancel={() => setAdminLoginVisible(false)}
-        footer={null}
+        onClose={() => setAdminLoginVisible(false)}
+        width={420}
       >
         <Form form={adminLoginForm} onFinish={handleAdminLogin} style={{ marginTop: 24 }}>
           <Form.Item name="username" rules={[{ required: true, message: '请输入用户名' }]}>
@@ -1382,14 +1408,14 @@ function App() {
             </Button>
           </Form.Item>
         </Form>
-      </Modal>
+      </Drawer>
 
-      {/* Admin Setup Modal (when no admins exist) */}
-      <Modal
+      {/* Admin Setup Drawer (when no admins exist) */}
+      <Drawer
         title="设置管理员"
         open={adminSetupVisible}
-        onCancel={() => setAdminSetupVisible(false)}
-        footer={null}
+        onClose={() => setAdminSetupVisible(false)}
+        width={420}
       >
         <div style={{ marginBottom: 16, color: textSecondary, fontSize: 13 }}>
           系统尚未设置管理员，请创建第一个管理员账号（将成为超级管理员）。
@@ -1407,119 +1433,78 @@ function App() {
             </Button>
           </Form.Item>
         </Form>
-      </Modal>
+      </Drawer>
 
-      {/* Admin Manage Modal */}
-      <Modal
+      {/* Admin Manage Drawer — pure CRUD for admin accounts (super admin only) */}
+      <Drawer
         title="管理员管理"
         open={adminManageVisible}
-        onCancel={() => setAdminManageVisible(false)}
-        footer={null}
-        width={400}
+        onClose={() => setAdminManageVisible(false)}
+        width={480}
       >
         <div style={{ marginTop: 16 }}>
-          <div style={{ marginBottom: 16, padding: 12, background: currentTheme === 'dark' ? '#3c4043' : '#f1f3f4', borderRadius: 8 }}>
-            <Text style={{ color: textSecondary, fontSize: 12 }}>当前管理员</Text>
-            <div style={{ marginTop: 4 }}>{adminUsername} {isSuperAdmin && <Badge status="success" text="超级管理员" />}</div>
-          </div>
-
-          {/* Change Password Section */}
           <div style={{ marginBottom: 16 }}>
-            <Text style={{ color: textSecondary, fontSize: 12, display: 'block', marginBottom: 8 }}>修改密码</Text>
+            <Text style={{ color: textSecondary, fontSize: 12, display: 'block', marginBottom: 8 }}>添加新管理员</Text>
             <Space.Compact style={{ width: '100%' }}>
-              <Input.Password placeholder="旧密码" id="oldAdminPassword" />
-              <Input.Password placeholder="新密码" id="newAdminPassword2" />
+              <Input placeholder="用户名" id="newAdminUsername" />
+              <Input.Password placeholder="密码" id="newAdminPassword" />
               <Button type="primary" onClick={async () => {
-                const oldPwd = (document.getElementById('oldAdminPassword') as HTMLInputElement).value;
-                const newPwd = (document.getElementById('newAdminPassword2') as HTMLInputElement).value;
-                if (!oldPwd || !newPwd) {
-                  message.warning('请输入旧密码和新密码');
+                const username = (document.getElementById('newAdminUsername') as HTMLInputElement).value;
+                const password = (document.getElementById('newAdminPassword') as HTMLInputElement).value;
+                if (!username || !password) {
+                  message.warning('请输入用户名和密码');
                   return;
                 }
-                if (newPwd.length < 6) {
-                  message.warning('新密码至少6字符');
+                if (username.length < 2) {
+                  message.warning('用户名至少2字符');
                   return;
                 }
-                const result = await api.changeAdminPassword(oldPwd, newPwd);
+                const result = await api.addAdminUser(username, password);
                 if (result.success) {
-                  message.success('密码已修改');
-                  (document.getElementById('oldAdminPassword') as HTMLInputElement).value = '';
-                  (document.getElementById('newAdminPassword2') as HTMLInputElement).value = '';
+                  message.success('添加成功');
+                  (document.getElementById('newAdminUsername') as HTMLInputElement).value = '';
+                  (document.getElementById('newAdminPassword') as HTMLInputElement).value = '';
+                  loadAdminUsers();
                 } else {
-                  message.error(result.message || '修改失败');
+                  message.error(result.message || '添加失败');
                 }
-              }}>修改</Button>
+              }}>添加</Button>
             </Space.Compact>
           </div>
 
-          {isSuperAdmin && (
-            <>
-              {/* View Logs Button */}
-              <div style={{ marginBottom: 16 }}>
-                <Button block onClick={() => window.open('/logs', '_blank')}>
-                  📋 查看系统日志
-                </Button>
+          <div>
+            <Text style={{ color: textSecondary, fontSize: 12, display: 'block', marginBottom: 8 }}>管理员列表</Text>
+            {adminUsers.map(user => (
+              <div key={user.username} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0', borderBottom: `1px solid ${borderColor}` }}>
+                <div>
+                  <UserOutlined style={{ marginRight: 8 }} />
+                  {user.username}
+                  {user.username === adminUsername && <Badge status="success" text="当前" style={{ marginLeft: 8 }} />}
+                </div>
+                {user.username !== adminUsername && (
+                  <Button size="small" danger onClick={() => handleDeleteAdmin(user.username)}>
+                    删除
+                  </Button>
+                )}
               </div>
-
-              <div style={{ marginBottom: 16 }}>
-                <Text style={{ color: textSecondary, fontSize: 12, display: 'block', marginBottom: 8 }}>添加新管理员</Text>
-                <Space.Compact style={{ width: '100%' }}>
-                  <Input placeholder="用户名" id="newAdminUsername" />
-                  <Input.Password placeholder="密码" id="newAdminPassword" />
-                  <Button type="primary" onClick={async () => {
-                    const username = (document.getElementById('newAdminUsername') as HTMLInputElement).value;
-                    const password = (document.getElementById('newAdminPassword') as HTMLInputElement).value;
-                    if (!username || !password) {
-                      message.warning('请输入用户名和密码');
-                      return;
-                    }
-                    if (username.length < 2) {
-                      message.warning('用户名至少2字符');
-                      return;
-                    }
-                    const result = await api.addAdminUser(username, password);
-                    if (result.success) {
-                      message.success('添加成功');
-                      (document.getElementById('newAdminUsername') as HTMLInputElement).value = '';
-                      (document.getElementById('newAdminPassword') as HTMLInputElement).value = '';
-                      loadAdminUsers();
-                    } else {
-                      message.error(result.message || '添加失败');
-                    }
-                  }}>添加</Button>
-                </Space.Compact>
-              </div>
-
-              <div>
-                <Text style={{ color: textSecondary, fontSize: 12, display: 'block', marginBottom: 8 }}>管理员列表</Text>
-                {adminUsers.map(user => (
-                  <div key={user.username} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0', borderBottom: `1px solid ${borderColor}` }}>
-                    <div>
-                      <UserOutlined style={{ marginRight: 8 }} />
-                      {user.username}
-                      {user.username === adminUsername && <Badge status="success" text="当前" style={{ marginLeft: 8 }} />}
-                    </div>
-                    {user.username !== adminUsername && (
-                      <Button size="small" danger onClick={() => handleDeleteAdmin(user.username)}>
-                        删除
-                      </Button>
-                    )}
-                  </div>
-                ))}
-                {adminUsers.length === 0 && <Text style={{ color: textSecondary }}>暂无其他管理员</Text>}
-              </div>
-            </>
-          )}
+            ))}
+            {adminUsers.length === 0 && <Text style={{ color: textSecondary }}>暂无其他管理员</Text>}
+          </div>
         </div>
-      </Modal>
+      </Drawer>
 
-      {/* Version History Modal */}
-      <Modal
+      {/* System Logs Drawer — any logged-in admin (super or regular) has equal access */}
+      <LogsDrawer visible={logsVisible} onClose={() => setLogsVisible(false)} />
+
+      {/* Change Own Password Drawer */}
+      <ChangePasswordDrawer visible={changePasswordVisible} onClose={() => setChangePasswordVisible(false)} />
+
+      {/* Version History Drawer */}
+      <Drawer
         title={`版本历史 — ${versionFile?.title || ''}`}
         open={versionModalVisible}
-        onCancel={() => setVersionModalVisible(false)}
-        footer={null}
-        width={500}
+        onClose={() => setVersionModalVisible(false)}
+        width={520}
       >
         <div style={{ marginTop: 16 }}>
           {/* Version list - exclude current version */}
@@ -1590,7 +1575,7 @@ function App() {
             )}
           </div>
         </div>
-      </Modal>
+      </Drawer>
 
       {/* Fixed Version Bar at Bottom */}
       {version && (

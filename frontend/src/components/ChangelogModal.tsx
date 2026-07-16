@@ -1,5 +1,5 @@
 /**
- * 版本更新日志弹窗组件
+ * 版本更新日志右侧抽屉组件
  *
  * 功能：
  * - 显示系统版本更新历史记录
@@ -10,7 +10,7 @@
  * <ChangelogModal visible={visible} onClose={onClose} />
  */
 
-import { Modal, Tag, Empty, message } from 'antd';
+import { Drawer, Tag, Empty, message } from 'antd';
 import type { ChangelogEntry } from '../types';
 
 interface ChangelogModalProps {
@@ -43,13 +43,11 @@ export default function ChangelogModal({ visible, entries, currentVersion, onClo
   };
 
   return (
-    <Modal
+    <Drawer
       title="📋 版本更新日志"
       open={visible}
-      onCancel={onClose}
-      footer={null}
-      width={600}
-      bodyStyle={{ maxHeight: 500, overflowY: 'auto' }}
+      onClose={onClose}
+      width={520}
     >
       {entries.length === 0 ? (
         <Empty description="暂无版本更新记录" style={{ margin: '40px 0' }} />
@@ -105,6 +103,6 @@ export default function ChangelogModal({ visible, entries, currentVersion, onClo
           })}
         </div>
       )}
-    </Modal>
+    </Drawer>
   );
 }

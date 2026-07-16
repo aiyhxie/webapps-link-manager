@@ -12,7 +12,7 @@
  * - 系统状态：getStatus
  */
 
-import type { FileInfo, ApiResponse, VersionsResponse, ChangelogEntry } from './types';
+import type { FileInfo, ApiResponse, VersionsResponse, ChangelogEntry, LogEntry } from './types';
 
 // API 基础路径
 const API_BASE = '/api';
@@ -185,6 +185,22 @@ export const api = {
         'X-Admin-Token': token || '',
       },
       body: JSON.stringify({ oldPassword, newPassword }),
+    });
+    return res.json();
+  },
+
+  async getLogs(params: { q?: string; actor?: string; ip?: string; category?: string; actionType?: string; page?: number; pageSize?: number }): Promise<ApiResponse & { logs?: LogEntry[]; total?: number; page?: number; pageSize?: number }> {
+    const token = getAdminToken();
+    const qs = new URLSearchParams();
+    if (params.q) qs.set('q', params.q);
+    if (params.actor) qs.set('actor', params.actor);
+    if (params.ip) qs.set('ip', params.ip);
+    if (params.category) qs.set('category', params.category);
+    if (params.actionType) qs.set('action_type', params.actionType);
+    qs.set('page', String(params.page || 1));
+    qs.set('pageSize', String(params.pageSize || 100));
+    const res = await fetch(`${API_BASE}/logs?${qs.toString()}`, {
+      headers: token ? { 'X-Admin-Token': token } : {},
     });
     return res.json();
   },

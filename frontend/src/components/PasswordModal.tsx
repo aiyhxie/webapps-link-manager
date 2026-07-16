@@ -1,5 +1,5 @@
 /**
- * 密码设置弹窗组件
+ * 密码设置右侧抽屉组件
  *
  * 功能：
  * - 为文件设置访问密码
@@ -10,7 +10,7 @@
  * <PasswordModal visible={visible} currentPassword={pwd} onClose={onClose} onSubmit={onSubmit} onClearPassword={onClear} />
  */
 
-import { Modal, Form, Input, Button, Space, message } from 'antd';
+import { Drawer, Form, Input, Button, Space, message } from 'antd';
 import { LockOutlined } from '@ant-design/icons';
 
 // Props 接口
@@ -44,7 +44,7 @@ export default function PasswordModal({ visible, currentPassword, onClose, onSub
   };
 
   return (
-    <Modal
+    <Drawer
       title={
         <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <LockOutlined />
@@ -52,12 +52,13 @@ export default function PasswordModal({ visible, currentPassword, onClose, onSub
         </span>
       }
       open={visible}
-      onCancel={onClose}
+      onClose={onClose}
       afterOpenChange={handleAfterOpenChange}
+      width={420}
       footer={
-        <Space>
+        <Space style={{ display: 'flex', justifyContent: 'flex-end', width: '100%' }}>
           {currentPassword && (
-            <Button danger onClick={onClearPassword}>
+            <Button danger onClick={onClearPassword} style={{ marginRight: 'auto' }}>
               清除密码
             </Button>
           )}
@@ -77,6 +78,6 @@ export default function PasswordModal({ visible, currentPassword, onClose, onSub
           <Input.Password placeholder="请输入密码（至少4位，留空则清除密码）" />
         </Form.Item>
       </Form>
-    </Modal>
+    </Drawer>
   );
 }

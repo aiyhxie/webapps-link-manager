@@ -48,6 +48,17 @@ export interface ChangelogEntry {
   type: string;  // "feature" | "security" | "fix" | "other"
 }
 
+// 审计日志条目
+export interface LogEntry {
+  time: string;
+  category: string;   // "project" | "admin" | "access"
+  action: string;
+  actor: string;
+  ip: string;
+  target: string;
+  detail: string;
+}
+
 // API 统一响应格式
 export interface ApiResponse<T = unknown> {
   success: boolean;

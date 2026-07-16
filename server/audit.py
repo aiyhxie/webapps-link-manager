@@ -95,26 +95,57 @@ def _load_all() -> List[Dict[str, Any]]:
     return out
 
 
-def query(q: str = "", actor: str = "", category: str = "",
-          limit: int = 1000) -> List[Dict[str, Any]]:
-    """Return matching entries, newest first, capped at `limit`.
+# Event-type classification (增/删/改/登录访问), derived from the `action`
+# field for filtering purposes. Distinct from `category` (project/admin/access)
+# which groups records by subject matter, not by the kind of operation.
+_ACTION_TYPE_KEYWORDS = [
+    ("delete", ["删除"]),
+    ("create", ["新建", "创建", "添加", "上传"]),
+    ("update", ["编辑", "设置密码", "清除密码", "恢复版本", "修改密码", "更新"]),
+    ("access", ["登录", "退出", "查看项目"]),
+]
+
+ACTION_TYPES = ("create", "delete", "update", "access")
+
+
+def classify_action_type(action: str) -> str:
+    """Classify an action string into create/delete/update/access."""
+    for action_type, keywords in _ACTION_TYPE_KEYWORDS:
+        if any(kw in action for kw in keywords):
+            return action_type
+    return "other"
+
+
+def query(q: str = "", actor: str = "", ip: str = "", category: str = "",
+          action_type: str = "", page: int = 1, page_size: int = 100
+          ) -> Dict[str, Any]:
+    """Return matching entries, newest first, paginated.
 
     - q: case-insensitive substring match across action/target/detail/actor/ip
-    - actor: case-insensitive substring match against actor OR ip
+    - actor: case-insensitive substring match against the actor field only
+    - ip: case-insensitive substring match against the ip field only
     - category: exact match against one of VALID_CATEGORIES
+    - action_type: exact match against one of ACTION_TYPES (see classify_action_type)
+    - page/page_size: 1-indexed pagination
+
+    Returns {"logs": [...], "total": N, "page": P, "pageSize": S}
     """
     entries = _load_all()
     q = (q or "").strip().lower()
     actor = (actor or "").strip().lower()
+    ip = (ip or "").strip().lower()
     category = (category or "").strip()
+    action_type = (action_type or "").strip()
 
     def matches(e: Dict[str, Any]) -> bool:
         if category and e.get("category") != category:
             return False
-        if actor:
-            hay = f"{e.get('actor','')} {e.get('ip','')}".lower()
-            if actor not in hay:
-                return False
+        if action_type and classify_action_type(e.get("action", "")) != action_type:
+            return False
+        if actor and actor not in str(e.get("actor", "")).lower():
+            return False
+        if ip and ip not in str(e.get("ip", "")).lower():
+            return False
         if q:
             hay = " ".join(str(e.get(k, "")) for k in
                            ("action", "target", "detail", "actor", "ip", "category")).lower()
@@ -124,4 +155,11 @@ def query(q: str = "", actor: str = "", category: str = "",
 
     filtered = [e for e in entries if matches(e)]
     filtered.reverse()  # newest first
-    return filtered[:limit]
+
+    total = len(filtered)
+    page = max(1, page)
+    page_size = max(1, min(page_size, 500))
+    start = (page - 1) * page_size
+    page_items = filtered[start:start + page_size]
+
+    return {"logs": page_items, "total": total, "page": page, "pageSize": page_size}

@@ -1,5 +1,5 @@
 /**
- * 编辑文件信息弹窗组件
+ * 编辑文件信息右侧抽屉组件
  *
  * 功能：
  * - 编辑文件标题、描述、产品线
@@ -9,7 +9,7 @@
  * <EditModal visible={visible} file={file} onClose={onClose} onSubmit={onSubmit} />
  */
 
-import { Modal, Form, Input, Button, Space, Select } from 'antd';
+import { Drawer, Form, Input, Button, Space, Select } from 'antd';
 import type { FileInfo } from '../types';
 import { PRODUCT_LINE_OPTIONS } from '../types';
 
@@ -95,13 +95,14 @@ export default function EditModal({ visible, file, onClose, onSubmit }: EditModa
   };
 
   return (
-    <Modal
+    <Drawer
       title="编辑文件信息"
       open={visible}
-      onCancel={onClose}
+      onClose={onClose}
       afterOpenChange={handleAfterOpenChange}
+      width={420}
       footer={
-        <Space>
+        <Space style={{ display: 'flex', justifyContent: 'flex-end', width: '100%' }}>
           <Button onClick={onClose}>取消</Button>
           <Button type="primary" onClick={handleSubmit}>保存</Button>
         </Space>
@@ -138,6 +139,6 @@ export default function EditModal({ visible, file, onClose, onSubmit }: EditModa
           />
         </Form.Item>
       </Form>
-    </Modal>
+    </Drawer>
   );
 }

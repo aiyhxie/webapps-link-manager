@@ -616,11 +616,16 @@ def create_app():
 
     @app.route("/api/logs", methods=["GET"])
     def get_logs():
-        """Get audit log entries (structured). Requires a valid admin session
-        token via X-Admin-Token header. Supports filtering:
-          - q:        keyword substring (action/target/detail/actor/ip/category)
-          - actor:    operator filter (matches admin name OR IP)
-          - category: project | admin | access
+        """Get audit log entries (structured), paginated. Requires a valid
+        admin session token via X-Admin-Token header — any logged-in admin
+        (super or regular) can view the full log; there is no per-admin
+        scoping. Supports filtering:
+          - q:           keyword substring (action/target/detail/actor/ip/category)
+          - actor:       filter by operator name/IP shown in the actor field
+          - ip:          filter by source IP
+          - category:    project | admin | access
+          - action_type: create | delete | update | access (see audit.classify_action_type)
+          - page, pageSize: 1-indexed pagination (default pageSize=100)
         """
         admin_token = request.headers.get("X-Admin-Token", "")
         if not admin_token or admin_token not in _admin_sessions:
@@ -628,10 +633,28 @@ def create_app():
 
         q = request.args.get("q", "")
         actor = request.args.get("actor", "")
+        ip = request.args.get("ip", "")
         category = request.args.get("category", "")
+        action_type = request.args.get("action_type", "")
         try:
-            entries = audit.query(q=q, actor=actor, category=category, limit=1000)
-            return jsonify({"success": True, "logs": entries})
+            page = int(request.args.get("page", 1))
+        except ValueError:
+            page = 1
+        try:
+            page_size = int(request.args.get("pageSize", 100))
+        except ValueError:
+            page_size = 100
+
+        try:
+            result = audit.query(q=q, actor=actor, ip=ip, category=category,
+                                  action_type=action_type, page=page, page_size=page_size)
+            return jsonify({
+                "success": True,
+                "logs": result["logs"],
+                "total": result["total"],
+                "page": result["page"],
+                "pageSize": result["pageSize"],
+            })
         except Exception as e:
             return jsonify({"success": False, "message": str(e)}), 500
 
@@ -687,53 +710,84 @@ def create_app():
             </div>
             <div class="filter-bar">
                 <input type="text" id="q" placeholder="按关键字搜索…" oninput="debouncedLoad()">
-                <input type="text" id="actor" placeholder="按操作者搜索（IP 或 管理员姓名）" oninput="debouncedLoad()">
-                <select id="category" onchange="loadLogs()">
+                <input type="text" id="actor" placeholder="按操作者筛选" oninput="debouncedLoad()">
+                <input type="text" id="ip" placeholder="按IP筛选" oninput="debouncedLoad()">
+                <select id="category" onchange="loadLogs(1)">
                     <option value="">全部类别</option>
-                    <option value="project">项目增删改</option>
+                    <option value="project">项目相关</option>
                     <option value="admin">管理员动作</option>
                     <option value="access">访问记录</option>
+                </select>
+                <select id="action_type" onchange="loadLogs(1)">
+                    <option value="">全部事件</option>
+                    <option value="create">新增</option>
+                    <option value="update">修改</option>
+                    <option value="delete">删除</option>
+                    <option value="access">登录/访问</option>
                 </select>
                 <span class="hint" id="count"></span>
             </div>
             <div class="wrap" id="wrap">
                 <div class="empty">加载中…</div>
             </div>
+            <div class="filter-bar" id="pager" style="display:none; justify-content:center;">
+                <button class="btn" onclick="prevPage()">‹ 上一页</button>
+                <span id="pageInfo" style="color:#ccc; font-size:13px;"></span>
+                <button class="btn" onclick="nextPage()">下一页 ›</button>
+            </div>
             <script>
                 const CAT_NAME = { project: '项目', admin: '管理员', access: '访问' };
+                const PAGE_SIZE = 100;
                 let _timer = null;
-                function debouncedLoad() { clearTimeout(_timer); _timer = setTimeout(loadLogs, 300); }
+                let _page = 1;
+                let _totalPages = 1;
+                function debouncedLoad() { clearTimeout(_timer); _timer = setTimeout(function(){ loadLogs(1); }, 300); }
                 function esc(s) {
                     return String(s == null ? '' : s)
                         .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
                         .replace(/"/g,'&quot;');
                 }
-                async function loadLogs() {
+                function prevPage() { if (_page > 1) loadLogs(_page - 1); }
+                function nextPage() { if (_page < _totalPages) loadLogs(_page + 1); }
+                async function loadLogs(page) {
+                    _page = page || _page || 1;
                     const wrap = document.getElementById('wrap');
                     const adminTok = localStorage.getItem('adminToken') || '';
                     if (!adminTok) { wrap.innerHTML = '<div class="empty">请先在首页登录管理员账号，再打开本页面</div>'; return; }
                     const q = document.getElementById('q').value.trim();
                     const actor = document.getElementById('actor').value.trim();
+                    const ip = document.getElementById('ip').value.trim();
                     const category = document.getElementById('category').value;
+                    const actionType = document.getElementById('action_type').value;
                     const params = new URLSearchParams();
                     if (q) params.set('q', q);
                     if (actor) params.set('actor', actor);
+                    if (ip) params.set('ip', ip);
                     if (category) params.set('category', category);
+                    if (actionType) params.set('action_type', actionType);
+                    params.set('page', String(_page));
+                    params.set('pageSize', String(PAGE_SIZE));
                     try {
                         const resp = await fetch('/api/logs?' + params.toString(), { headers: { 'X-Admin-Token': adminTok } });
                         if (resp.status === 401) { wrap.innerHTML = '<div class="empty">会话已过期，请回首页重新登录管理员账号</div>'; return; }
                         const data = await resp.json();
-                        if (data.success && Array.isArray(data.logs)) { render(data.logs); }
+                        if (data.success && Array.isArray(data.logs)) { render(data.logs, data.total || 0); }
                         else { wrap.innerHTML = '<div class="empty">' + esc(data.message || '加载失败') + '</div>'; }
                     } catch(e) {
                         wrap.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>';
                     }
                 }
                 function fmtTime(t) { return String(t || '').replace('T', ' '); }
-                function render(logs) {
+                function render(logs, total) {
                     const wrap = document.getElementById('wrap');
-                    document.getElementById('count').textContent = '共 ' + logs.length + ' 条';
-                    if (!logs.length) { wrap.innerHTML = '<div class="empty">暂无匹配的日志记录</div>'; return; }
+                    const pager = document.getElementById('pager');
+                    document.getElementById('count').textContent = '共 ' + total + ' 条';
+                    _totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+                    if (!logs.length) {
+                        wrap.innerHTML = '<div class="empty">暂无匹配的日志记录</div>';
+                        pager.style.display = 'none';
+                        return;
+                    }
                     let rows = logs.map(function(e) {
                         const cat = e.category || '';
                         const danger = /删除|失败/.test(e.action || '') ? ' danger' : '';
@@ -750,8 +804,10 @@ def create_app():
                     wrap.innerHTML = '<table><thead><tr>' +
                         '<th>时间</th><th>类别</th><th>操作者</th><th>来源IP</th><th>操作</th><th>项目/对象</th><th>备注</th>' +
                         '</tr></thead><tbody>' + rows + '</tbody></table>';
+                    pager.style.display = 'flex';
+                    document.getElementById('pageInfo').textContent = '第 ' + _page + ' / ' + _totalPages + ' 页';
                 }
-                loadLogs();
+                loadLogs(1);
             </script>
         </body>
         </html>
