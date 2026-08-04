@@ -66,7 +66,7 @@ graph TD
 
 ## Tasks
 
-- [ ] 1. 搭建配置与凭据基础设施
+- [x] 1. 搭建配置与凭据基础设施
   - 在 `server/config.py` 新增配置项：`AUTH_MODE`（`embedded` / `gateway`，默认 `embedded`，非法值启动终止）、`TRUSTED_GATEWAY_IPS`、`ADMIN_ORIGIN`、`PREVIEW_ORIGIN`、`EMERGENCY_BIND`、`PREVIEW_SANDBOX`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`AUTH_SIGNING_SECRET`、`DEPLOY_ENV`
   - 实现 `.env` 读取（标准库解析，不引入 python-dotenv），环境变量优先于 `.env`
   - 启动校验：`FEISHU_APP_ID` / `FEISHU_APP_SECRET` 缺失或空白则终止进程且不监听端口，错误信息只报变量名不带取值
