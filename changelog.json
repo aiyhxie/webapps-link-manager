@@ -1,6 +1,24 @@
 {
-  "last_recorded_version": "1.0.19",
+  "last_recorded_version": "1.0.22",
   "entries": [
+    {
+      "version": "1.0.22",
+      "date": "2026-08-04T11:23:51.650898",
+      "changelog": "权限体系修复：1. 版本历史中无权限用户不再显示恢复此版本入口，与删除版本保持一致，仅保留预览；2. 修复管理员全量权限失效的问题：前端所有写接口(上传项目/上传新版本/编辑信息/设置密码/删除项目/恢复版本/删除版本)补上X-Admin-Token，此前后端看不到管理员会话导致按钮亮着但请求被403，且审计日志操作者记成IP而非管理员姓名；3. 后端delete_file/restore_version_file/delete_version_file增加is_admin参数并由路由透传，管理员不再被内层IP校验拦掉(此前delete_file路由取了admin_user却未使用)；4. 补上PUT /api/files/<key>缺失的权限校验，此前任何人可修改任意项目的标题/描述/产品线/密码；历史遗留文件(无metadata或uploader_ip为空)仍视为无IP限制保持可编辑",
+      "type": "security"
+    },
+    {
+      "version": "1.0.21",
+      "date": "2026-08-03T19:30:31.583704",
+      "changelog": "深色模式显示样式整体优化：1. ConfigProvider补上antd主题algorithm(深色darkAlgorithm/浅色defaultAlgorithm)，修复此前只覆盖token导致placeholder、关闭图标、分割线等派生色仍取浅色值、在深底上看不清的问题(影响登录页、编辑文件信息、设置密码、修改密码等所有输入框与抽屉)；2. 深色下额外提亮colorTextPlaceholder/colorTextDescription/colorIcon/colorSplit保证可读性；3. 版本更新日志抽屉去掉硬编码浅色值(#333/#555/#999/#f0f0f0)改用主题token，正文在深色下清晰可读；4. 系统日志抽屉红色文案与主题切换勾选图标改为主题感知取色",
+      "type": "security"
+    },
+    {
+      "version": "1.0.20",
+      "date": "2026-08-03T19:07:18.939213",
+      "changelog": "1. 新增上传进度条：上传接口改用XMLHttpRequest上报进度，新项目上传在上传卡片内显示进度条、版本更新在对应项目卡片顶部显示进度条，字节发送完成后显示处理中状态；2. 去掉上传新项目时同名自动升版本的逻辑：通过上传新项目入口一律创建新项目，重名时文件名/目录名与标题同步追加数字后缀(1、2、3…)；3. 顺带修复ZIP同名上传会合并覆盖已有项目目录并清空其版本历史的问题，以及ZIP顶层目录名未做路径穿越校验的问题",
+      "type": "feature"
+    },
     {
       "version": "1.0.19",
       "date": "2026-07-15T22:00:59.321484",

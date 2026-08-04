@@ -10,7 +10,7 @@
  * <ChangelogModal visible={visible} onClose={onClose} />
  */
 
-import { Drawer, Tag, Empty, message } from 'antd';
+import { Drawer, Tag, Empty, message, theme } from 'antd';
 import type { ChangelogEntry } from '../types';
 
 interface ChangelogModalProps {
@@ -35,6 +35,9 @@ const TYPE_LABELS: Record<string, string> = {
 };
 
 export default function ChangelogModal({ visible, entries, currentVersion, onClose }: ChangelogModalProps) {
+  // 用主题 token 取色，避免硬编码浅色值在深色模式下看不清
+  const { token } = theme.useToken();
+
   const handleCopyVersion = (entry: ChangelogEntry) => {
     const text = `[${entry.version}] ${entry.date.slice(0, 10)}\n${entry.changelog}`;
     navigator.clipboard.writeText(text).then(() => {
@@ -60,7 +63,7 @@ export default function ChangelogModal({ visible, entries, currentVersion, onClo
                 key={entry.version}
                 style={{
                   padding: '16px 0',
-                  borderBottom: index < entries.length - 1 ? '1px solid #f0f0f0' : 'none',
+                  borderBottom: index < entries.length - 1 ? `1px solid ${token.colorSplit}` : 'none',
                 }}
               >
                 {/* 版本号 + 日期 + 类型标签 */}
@@ -70,7 +73,7 @@ export default function ChangelogModal({ visible, entries, currentVersion, onClo
                     style={{
                       fontWeight: 600,
                       fontSize: 15,
-                      color: isLatest ? '#1677ff' : '#333',
+                      color: isLatest ? token.colorPrimary : token.colorText,
                       cursor: 'pointer',
                       textDecoration: isLatest ? 'underline' : 'none',
                     }}
@@ -82,7 +85,7 @@ export default function ChangelogModal({ visible, entries, currentVersion, onClo
                   <Tag color={TYPE_COLORS[entry.type] || 'default'} style={{ margin: 0 }}>
                     {TYPE_LABELS[entry.type] || entry.type}
                   </Tag>
-                  <span style={{ fontSize: 12, color: '#999', marginLeft: 'auto' }}>
+                  <span style={{ fontSize: 12, color: token.colorTextTertiary, marginLeft: 'auto' }}>
                     {entry.date.slice(0, 10)}
                   </span>
                 </div>
@@ -90,7 +93,7 @@ export default function ChangelogModal({ visible, entries, currentVersion, onClo
                 <div
                   style={{
                     fontSize: 13,
-                    color: '#555',
+                    color: token.colorTextSecondary,
                     lineHeight: 1.8,
                     whiteSpace: 'pre-wrap',
                     marginLeft: 4,

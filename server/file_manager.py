@@ -395,11 +395,72 @@ def scan_webapps() -> List[Dict[str, Any]]:
     return sorted(files, key=lambda x: x["path"])
 
 
+def _existing_titles() -> set:
+    """Collect the titles of all existing projects (used for title dedup)."""
+    titles = set()
+    try:
+        meta = metadata.load_metadata()
+    except Exception:
+        return titles
+    for key, value in meta.items():
+        if not key.startswith("file:") or not isinstance(value, dict):
+            continue
+        if value.get("parent_key"):
+            continue
+        title = value.get("title")
+        if title:
+            titles.add(title)
+    return titles
+
+
+def allocate_unique_project_name(base_name: str, base_title: str,
+                                 is_dir: bool = False) -> Tuple[str, str]:
+    """
+    Allocate a (name, title) pair for a BRAND NEW project so that it never
+    collides with an existing one.
+
+    Uploading via the "上传新项目" entry always creates a new project — it must
+    never silently overwrite or version-bump an existing project of the same
+    name. When the desired name/title is already taken, an incrementing number
+    is appended (1, 2, 3, ...). The same number is used for both the physical
+    name and the title so they stay in sync, e.g. `首页1.html` / "首页1".
+
+    - base_name: desired file name ("首页.html") or directory name ("abc")
+    - base_title: desired display title (falls back to the name when empty)
+    - is_dir: True when base_name is a project directory (ZIP upload)
+
+    Returns (name, title).
+    """
+    titles = _existing_titles()
+    if is_dir:
+        stem, ext = base_name, ""
+    else:
+        p = Path(base_name)
+        stem, ext = p.stem, p.suffix
+
+    for n in range(0, 10000):
+        suffix = "" if n == 0 else str(n)
+        name = f"{stem}{suffix}{ext}"
+        title = f"{base_title}{suffix}" if base_title else name
+        path_free = not (WEBAPPS_DIR / name).exists()
+        key_free = not metadata.file_exists(f"file:{name}" if not is_dir
+                                            else f"file:{name}/index.html")
+        if path_free and key_free and title not in titles:
+            return name, title
+
+    # Extremely unlikely fallback: timestamp-based name
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    return f"{stem}_{stamp}{ext}", f"{base_title or stem}_{stamp}"
+
+
 def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool, str, str]:
     """
-    Save an uploaded HTML file to webapps directory.
-    If the file already exists, archive the old content as a new version and
-    save the new content to the original path.
+    Save an uploaded HTML file to webapps directory as a NEW project.
+
+    Same-name uploads no longer overwrite / version-bump the existing project:
+    a unique file name and title are allocated instead (foo.html -> foo1.html).
+    Version updates go through the dedicated "上传新版本" entry
+    (update_file_version / extract_zip_for_version).
     Returns (success, message, key)
     """
     if not filename.lower().endswith(".html"):
@@ -412,63 +473,33 @@ def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool
             return False, "无效的文件名", ""
         if not safe.lower().endswith(".html"):
             return False, "只支持 HTML 文件", ""
+
+        # Extract title/description from the HTML content first — the title
+        # participates in the uniqueness allocation below.
+        raw_title, description = extract_html_title_description(file_data)
+        base_title = raw_title or Path(safe).stem
+
+        # Always create a NEW project: allocate a非冲突 name + title pair
+        safe, title = allocate_unique_project_name(safe, base_title, is_dir=False)
+
         dest_path = WEBAPPS_DIR / safe
-        key = f"file:{safe}"
-
-        # Check if file already exists (new version scenario)
-        if dest_path.exists():
-            # Archive old content as previous version
-            old_content = dest_path.read_bytes()
-            old_meta = metadata.get_file_meta(key)
-            prev_version = old_meta.get("current_version", "V1") if old_meta else "V1"
-            # Save old content to versions directory with version suffix
-            version_filename = f"{safe}__{prev_version}"
-            version_path = VERSIONS_DIR / version_filename
-            version_path.write_bytes(old_content)
-            # Add new version to metadata
-            metadata.add_version(key, uploader_ip)
-
-        # Write new content to original path
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
         dest_path.write_bytes(file_data)
         rel_path = dest_path.relative_to(WEBAPPS_DIR)
         key = f"file:{rel_path.as_posix()}"
 
-        # Extract title and description from HTML content
-        title, description = extract_html_title_description(file_data)
-
-        # Use filename as title if no title found in HTML
-        if not title:
-            title = safe
-
         # Auto-detect product line from title and description
         product_line = detect_product_line(title, description)
 
-        # Check if metadata already exists (new version vs new file)
-        existing_meta = metadata.get_file_meta(key)
-        if existing_meta:
-            # Update existing metadata — upload_time tracks latest version upload
-            # init_upload_time is preserved (first creation time)
-            metadata.touch_file_meta(
-                key,
-                upload_time=datetime.now().isoformat(),
-                uploader_ip=uploader_ip,
-            )
-        else:
-            # Save new metadata
-            metadata.set_file_meta(
-                key=key,
-                title=title,
-                uploader_ip=uploader_ip,
-                description=description,
-                original_name=filename,
-                product_line=product_line,
-            )
+        metadata.set_file_meta(
+            key=key,
+            title=title,
+            uploader_ip=uploader_ip,
+            description=description,
+            original_name=filename,
+            product_line=product_line,
+        )
 
-        # Get current version number for success message
-        versions_info = metadata.get_versions(key)
-        current_v = versions_info.get("current_version", "V1")
-        if dest_path.exists() and existing_meta:
-            return True, f"已更新为 {current_v} 版本", key
         return True, f"已上传 {safe}", key
     except Exception as e:
         return False, f"上传失败: {str(e)}", ""
@@ -570,7 +601,6 @@ def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]
 
         # Determine base folder
         if has_root_index and not has_subfolder_index:
-            from datetime import datetime
             base_folder = f"uploaded_{datetime.now().strftime('%Y%m%d%H%M%S')}"
             base_prefix = ''
         else:
@@ -578,8 +608,40 @@ def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]
             base_folder = first_file.split('/')[0] if first_file else f"uploaded_{datetime.now().strftime('%Y%m%d%H%M%S')}"
             base_prefix = base_folder + '/'
 
+        # Sanitize the folder name coming from the ZIP (prevents '..' or other
+        # path components from escaping WEBAPPS_DIR).
+        base_folder = safe_filename(base_folder) or f"uploaded_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+
+        # Read the entry HTML's title up-front: it takes part in the uniqueness
+        # allocation below, and we must know the final folder name before
+        # creating any directory.
+        entry_name = None
+        if base_prefix:
+            entry_name = next((n for n in all_names if n == base_prefix + 'index.html'), None)
+            if not entry_name:
+                entry_name = next((n for n in all_names if n.endswith('/index.html')), None)
+        else:
+            entry_name = 'index.html' if 'index.html' in all_names else None
+
+        entry_title, entry_desc = "", ""
+        if entry_name and name_mapping.get(entry_name):
+            try:
+                with zipfile.ZipFile(io.BytesIO(zip_data), "r") as zf_probe:
+                    entry_title, entry_desc = extract_html_title_description(
+                        zf_probe.read(name_mapping[entry_name])
+                    )
+            except Exception:
+                entry_title, entry_desc = "", ""
+
+        # Always create a NEW project: never merge into / overwrite an existing
+        # project directory. Same-name uploads get a numeric suffix, applied to
+        # both the folder name and the display title so they stay in sync.
+        base_folder, project_title = allocate_unique_project_name(
+            base_folder, entry_title or base_folder, is_dir=True
+        )
+
         extract_to = WEBAPPS_DIR / base_folder
-        extract_to.mkdir(parents=True, exist_ok=True)
+        extract_to.mkdir(parents=True, exist_ok=False)
 
         # Extract files
         main_html_key = None
@@ -620,37 +682,38 @@ def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]
                 except Exception as e:
                     pass
 
-                # If this is index.html, set metadata
-                if rel_path == 'index.html' or clean.endswith('/index.html'):
+                # Project entry (index.html at the project root): set metadata.
+                # The title is the pre-allocated, collision-free one.
+                if rel_path == 'index.html':
                     try:
                         content = file_path.read_bytes()
-                        title, description = extract_html_title_description(content)
-                        product_line = detect_product_line(title, description)
+                        _, description = extract_html_title_description(content)
+                        product_line = detect_product_line(project_title, description)
                         rel_path_key = file_path.relative_to(WEBAPPS_DIR)
                         key = f"file:{rel_path_key.as_posix()}"
                         metadata.set_file_meta(
                             key=key,
-                            title=title or "index.html",
+                            title=project_title or "index.html",
                             uploader_ip=uploader_ip,
                             description=description,
                             original_name="index.html",
                             product_line=product_line,
                         )
                         main_html_key = key
-                    except:
+                    except Exception:
                         pass
 
         if not main_html_key:
             for f in extract_to.rglob('index.html'):
                 try:
                     content = f.read_bytes()
-                    title, description = extract_html_title_description(content)
-                    product_line = detect_product_line(title, description)
+                    _, description = extract_html_title_description(content)
+                    product_line = detect_product_line(project_title, description)
                     rel_path_key = f.relative_to(WEBAPPS_DIR)
                     key = f"file:{rel_path_key.as_posix()}"
                     metadata.set_file_meta(
                         key=key,
-                        title=title or "index.html",
+                        title=project_title or "index.html",
                         uploader_ip=uploader_ip,
                         description=description,
                         original_name="index.html",
@@ -658,7 +721,7 @@ def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]
                     )
                     main_html_key = key
                     break
-                except:
+                except Exception:
                     continue
 
         if not main_html_key:
@@ -868,9 +931,10 @@ def _delete_all_archives(rel_path: str) -> None:
                 pass
 
 
-def delete_file(key: str, request_ip: str) -> Tuple[bool, str]:
+def delete_file(key: str, request_ip: str, is_admin: bool = False) -> Tuple[bool, str]:
     """
-    Delete a project if the request IP matches the uploader IP.
+    Delete a project if the request IP matches the uploader IP, or if the
+    caller is a logged-in admin (admins have full rights on every project).
 
     For multi-file (directory) projects, the ENTIRE project directory is
     removed (not just index.html) so images/CSS/JS/sub-pages never linger
@@ -889,13 +953,13 @@ def delete_file(key: str, request_ip: str) -> Tuple[bool, str]:
     if not file_path.exists():
         return False, "文件不存在"
 
-    # Check IP permission
+    # Check permission (admins bypass the IP check entirely)
     meta = metadata.get_file_meta(key)
     if not meta:
-        # File exists on disk but no metadata - treat as no permission
-        return False, "无权删除此文件"
-
-    if meta.get("uploader_ip") != request_ip:
+        # File exists on disk but no metadata - only admins may clean it up
+        if not is_admin:
+            return False, "无权删除此文件"
+    elif not is_admin and meta.get("uploader_ip") != request_ip:
         return False, "无权删除：只能删除自己上传的文件"
 
     try:
@@ -1145,7 +1209,8 @@ def get_current_content(filename: str) -> Optional[bytes]:
     return None
 
 
-def restore_version_file(key: str, version: str, request_ip: str) -> Tuple[bool, str]:
+def restore_version_file(key: str, version: str, request_ip: str,
+                         is_admin: bool = False) -> Tuple[bool, str]:
     """
     Restore a historical version as the current version.
 
@@ -1157,7 +1222,7 @@ def restore_version_file(key: str, version: str, request_ip: str) -> Tuple[bool,
 
     Returns (success, message).
     """
-    if not can_delete(key, request_ip):
+    if not is_admin and not can_delete(key, request_ip):
         return False, "无权恢复此版本"
 
     filename = key[5:] if key.startswith("file:") else key
@@ -1212,14 +1277,15 @@ def restore_version_file(key: str, version: str, request_ip: str) -> Tuple[bool,
     return True, f"已恢复为 {version} 版本"
 
 
-def delete_version_file(key: str, version: str, request_ip: str) -> Tuple[bool, str]:
+def delete_version_file(key: str, version: str, request_ip: str,
+                        is_admin: bool = False) -> Tuple[bool, str]:
     """
     Delete a historical version's archive (new directory-zip format or
     legacy single-file format, whichever exists).
     Returns (success, message).
     """
-    # Check permission
-    if not can_delete(key, request_ip):
+    # Check permission (admins may manage every project's versions)
+    if not is_admin and not can_delete(key, request_ip):
         return False, "无权删除此版本"
 
     # Get filename from key

@@ -398,6 +398,14 @@ def create_app():
 
         # Check if key exists
         existing = metadata.get_file_meta(key)
+
+        # Permission: uploader IP, or any logged-in admin (admins have full
+        # rights on every project). Legacy files with no metadata / no
+        # uploader_ip carry no IP restriction — same semantics as can_delete()
+        # — so hand-placed files stay editable.
+        client_ip = get_client_ip()
+        if existing and not file_manager.can_delete(key, client_ip) and not get_current_admin():
+            return jsonify({"success": False, "message": "无权编辑此项目"}), 403
         if not existing:
             # Create metadata entry for file without metadata
             if key.startswith("file:"):
@@ -499,7 +507,8 @@ def create_app():
         if not file_manager.can_delete(key, client_ip) and not admin_user:
             return jsonify({"success": False, "message": "无权恢复此版本"}), 403
 
-        success, message = file_manager.restore_version_file(key, version, client_ip)
+        success, message = file_manager.restore_version_file(
+            key, version, client_ip, is_admin=bool(admin_user))
         if success:
             audit_project("恢复版本", key, detail=f"-> {version}")
             return jsonify({"success": True, "message": message})
@@ -515,7 +524,8 @@ def create_app():
         if not file_manager.can_delete(key, client_ip) and not admin_user:
             return jsonify({"success": False, "message": "无权删除此版本"}), 403
 
-        success, message = file_manager.delete_version_file(key, version, client_ip)
+        success, message = file_manager.delete_version_file(
+            key, version, client_ip, is_admin=bool(admin_user))
         if success:
             audit_project("删除版本", key, detail=f"{version}")
             return jsonify({"success": True, "message": message})
@@ -524,10 +534,11 @@ def create_app():
 
     @app.route("/api/files/<path:key>", methods=["DELETE"])
     def delete_file(key):
-        """Delete a file (requires IP match)."""
+        """Delete a project (uploader IP match, or any logged-in admin)."""
         client_ip = get_client_ip()
         admin_user = get_current_admin()
-        success, message = file_manager.delete_file(key, client_ip)
+        success, message = file_manager.delete_file(
+            key, client_ip, is_admin=bool(admin_user))
 
         if success:
             audit_project("删除项目", key)

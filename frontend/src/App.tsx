@@ -17,7 +17,7 @@
  * - components/PasswordModal.tsx: 设置/修改密码弹窗
  */
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { ConfigProvider, Layout, Typography, message, Input, Button, Space, Card, Empty, Tooltip, Popconfirm, Drawer, Badge, Dropdown, MenuProps, Form } from 'antd';
+import { ConfigProvider, Layout, Typography, message, Input, Button, Space, Card, Empty, Tooltip, Popconfirm, Drawer, Badge, Dropdown, MenuProps, Form, Progress, theme as antdTheme } from 'antd';
 import { SearchOutlined, CopyOutlined, EditOutlined, DeleteOutlined, DesktopOutlined, GlobalOutlined, MenuOutlined, AppstoreOutlined, SunOutlined, MoonOutlined, MoreOutlined, PlusOutlined, CheckOutlined, LockOutlined, UnlockOutlined, InboxOutlined, UserOutlined, LogoutOutlined, TeamOutlined, KeyOutlined, FileTextOutlined, DownOutlined } from '@ant-design/icons';
 import EditModal from './components/EditModal';
 import PasswordModal from './components/PasswordModal';
@@ -30,12 +30,28 @@ import { api, setAdminToken, clearAdminToken } from './api';
 
 type SortMode = 'init_desc' | 'init_asc' | 'update_desc' | 'update_asc' | 'product_line' | 'ip';
 
+/** In-flight upload state used to drive the progress UI. */
+type UploadState = { name: string; percent: number; processing: boolean };
+
 const { Header, Sider, Content } = Layout;
 const { Text } = Typography;
 
 type ThemeMode = 'light' | 'dark' | 'auto';
 
+/**
+ * antd 主题配置。
+ *
+ * 必须带上 algorithm：antd v5 的大量颜色是从 seed token 经 algorithm 派生的
+ * （colorTextPlaceholder / colorTextDescription / colorIcon / colorSplit 等）。
+ * 只覆盖 colorText、colorBgContainer 这类 token 而不切换 algorithm 时，派生色
+ * 仍是浅色主题的值（如 placeholder 为 rgba(0,0,0,0.25)），画在深色底上几乎看
+ * 不见 —— 这正是深色模式下输入框提示文字、抽屉关闭图标、分割线发暗的原因。
+ *
+ * token 里继续钉住项目原有的 Google 风格底色，保证卡片/抽屉底色与改动前一致，
+ * 只让文字、图标、边框这些派生色走正确的算法。
+ */
 const lightTheme = {
+  algorithm: antdTheme.defaultAlgorithm,
   token: {
     colorPrimary: '#4285f4',
     colorBgContainer: '#ffffff',
@@ -48,6 +64,7 @@ const lightTheme = {
 };
 
 const darkTheme = {
+  algorithm: antdTheme.darkAlgorithm,
   token: {
     colorPrimary: '#8ab4f8',
     colorBgContainer: '#292a2d',
@@ -56,6 +73,12 @@ const darkTheme = {
     colorText: '#e8eaed',
     colorTextSecondary: '#9aa0a6',
     colorBgLayout: '#202124',
+    // 暗色算法默认的这几个值在本项目底色上仍偏暗，统一提一档保证可读性
+    colorTextPlaceholder: 'rgba(255,255,255,0.45)',
+    colorTextDescription: 'rgba(255,255,255,0.6)',
+    colorIcon: 'rgba(255,255,255,0.65)',
+    colorIconHover: '#ffffff',
+    colorSplit: 'rgba(255,255,255,0.16)',
   },
 };
 
@@ -83,6 +106,12 @@ function App() {
 
   // Card-level success tip state
   const [successTip, setSuccessTip] = useState<{ key: string; message: string } | null>(null);
+
+  // Upload progress state.
+  // `processing` = all bytes sent, server is still unzipping/writing, so the
+  // bar sits at 100% with a "处理中" label instead of looking stuck.
+  const [newUpload, setNewUpload] = useState<UploadState | null>(null);
+  const [versionUploads, setVersionUploads] = useState<Record<string, UploadState>>({});
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     const saved = localStorage.getItem('themeMode');
     return (saved as ThemeMode) || 'auto';
@@ -260,7 +289,15 @@ function App() {
   }, [files, searchText, selectedIp, selectedProductLine, sortMode]);
 
   const handleUpload = async (file: File) => {
-    const result = await api.uploadFile(file);
+    if (newUpload) {
+      message.warning('有文件正在上传，请稍候');
+      return false;
+    }
+    setNewUpload({ name: file.name, percent: 0, processing: false });
+    const result = await api.uploadFile(file, (percent) => {
+      setNewUpload(prev => (prev ? { ...prev, percent, processing: percent >= 100 } : prev));
+    });
+    setNewUpload(null);
     if (result.success) {
       message.success(result.message || '上传成功');
       loadFiles();
@@ -476,7 +513,23 @@ function App() {
   };
 
   const handleUploadNewVersion = async (targetFile: FileInfo, file: File) => {
-    const result = await api.uploadNewVersion(targetFile.key, file);
+    if (versionUploads[targetFile.key]) {
+      message.warning('该项目正在上传新版本，请稍候');
+      return;
+    }
+    const setProgress = (state: UploadState | null) => {
+      setVersionUploads(prev => {
+        const next = { ...prev };
+        if (state) next[targetFile.key] = state;
+        else delete next[targetFile.key];
+        return next;
+      });
+    };
+    setProgress({ name: file.name, percent: 0, processing: false });
+    const result = await api.uploadNewVersion(targetFile.key, file, (percent) => {
+      setProgress({ name: file.name, percent, processing: percent >= 100 });
+    });
+    setProgress(null);
     if (result.success) {
       message.success(`${targetFile.title} ${result.version} 版本更新成功`);
       loadFiles();
@@ -578,10 +631,12 @@ function App() {
     auto: <DesktopOutlined />,
   }[themeMode];
 
+  // 勾选图标跟随主题主色，深色模式下 #4285f4 在深底上对比度不足
+  const accentColor = currentTheme === 'dark' ? '#8ab4f8' : '#4285f4';
   const themeItems: MenuProps['items'] = [
-    { key: 'auto', label: <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>跟随系统 {themeMode === 'auto' && <CheckOutlined style={{ color: '#4285f4' }} />}</span> },
-    { key: 'light', label: <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>浅色模式 {themeMode === 'light' && <CheckOutlined style={{ color: '#4285f4' }} />}</span> },
-    { key: 'dark', label: <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>深色模式 {themeMode === 'dark' && <CheckOutlined style={{ color: '#4285f4' }} />}</span> },
+    { key: 'auto', label: <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>跟随系统 {themeMode === 'auto' && <CheckOutlined style={{ color: accentColor }} />}</span> },
+    { key: 'light', label: <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>浅色模式 {themeMode === 'light' && <CheckOutlined style={{ color: accentColor }} />}</span> },
+    { key: 'dark', label: <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>深色模式 {themeMode === 'dark' && <CheckOutlined style={{ color: accentColor }} />}</span> },
   ];
 
   const productItems: MenuProps['items'] = [
@@ -992,16 +1047,16 @@ function App() {
                     onDragOver={handleDragOver}
                     onDragLeave={handleDragLeave}
                     onDrop={handleDrop}
-                    onClick={() => fileInputRef.current?.click()}
+                    onClick={() => { if (!newUpload) fileInputRef.current?.click(); }}
                     className="file-card upload-card"
                     style={{
-                      background: isDragging
+                      background: isDragging && !newUpload
                         ? (currentTheme === 'dark' ? 'rgba(138,180,248,0.85)' : 'rgba(66,133,244,0.75)')
                         : cardBg,
-                      border: `2px dashed ${isDragging ? (currentTheme === 'dark' ? '#8ab4f8' : '#4285f4') : borderColor}`,
+                      border: `2px dashed ${isDragging && !newUpload ? (currentTheme === 'dark' ? '#8ab4f8' : '#4285f4') : borderColor}`,
                       borderRadius: 12,
                       minHeight: 120,
-                      cursor: 'pointer',
+                      cursor: newUpload ? 'progress' : 'pointer',
                       display: 'flex',
                       flexDirection: 'column',
                       alignItems: 'center',
@@ -1016,7 +1071,29 @@ function App() {
                       onChange={handleFileInputChange}
                       style={{ display: 'none' }}
                     />
-                    {isDragging ? (
+                    {newUpload ? (
+                      <div style={{ width: '80%', textAlign: 'center' }}>
+                        <div style={{
+                          color: textColor,
+                          fontSize: 12,
+                          marginBottom: 6,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}>
+                          {newUpload.name}
+                        </div>
+                        <Progress
+                          percent={newUpload.percent}
+                          status="active"
+                          size="small"
+                          showInfo={!newUpload.processing}
+                        />
+                        <div style={{ color: textSecondary, fontSize: 11, marginTop: 2 }}>
+                          {newUpload.processing ? '上传完成，正在处理…' : `上传中 ${newUpload.percent}%`}
+                        </div>
+                      </div>
+                    ) : isDragging ? (
                       <>
                         <InboxOutlined style={{ fontSize: 28, color: '#ffffff', marginBottom: 8 }} />
                         <div style={{ color: '#ffffff', fontSize: 13 }}>释放以上传</div>
@@ -1071,6 +1148,34 @@ function App() {
                         }}
                         bodyStyle={{ padding: 0, display: 'flex', flexDirection: 'column', height: '100%' }}
                       >
+                        {/* Version upload progress banner */}
+                        {versionUploads[file.key] && (
+                          <div
+                            onClick={(e) => e.stopPropagation()}
+                            style={{
+                              background: currentTheme === 'dark' ? 'rgba(138,180,248,0.16)' : 'rgba(66,133,244,0.08)',
+                              padding: '5px 12px 2px',
+                              borderRadius: '12px 12px 0 0',
+                              flexShrink: 0,
+                            }}
+                          >
+                            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 11, color: textSecondary }}>
+                              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {versionUploads[file.key].name}
+                              </span>
+                              <span style={{ flexShrink: 0 }}>
+                                {versionUploads[file.key].processing ? '处理中…' : `上传中 ${versionUploads[file.key].percent}%`}
+                              </span>
+                            </div>
+                            <Progress
+                              percent={versionUploads[file.key].percent}
+                              status="active"
+                              size="small"
+                              showInfo={false}
+                            />
+                          </div>
+                        )}
+
                         {/* Success tip banner */}
                         {successTip?.key === file.key && (
                           <div style={{
@@ -1550,9 +1655,13 @@ function App() {
                     <Button size="small" onClick={() => window.open(`/versions/${versionFile?.path}/${version}`, '_blank')}>
                       预览
                     </Button>
-                    <Button size="small" onClick={() => handleRestoreVersion(version)}>
+                    {/* 恢复入口仅对有编辑权限的用户显示（上传者本人或已登录管理员）；
+                        版本列表与预览本身无需权限，任何人可见 */}
+                    {versionFile?.canDelete && (
+                      <Button size="small" onClick={() => handleRestoreVersion(version)}>
                         恢复此版本
-                    </Button>
+                      </Button>
+                    )}
                     {versionFile?.canDelete && (
                       <Popconfirm
                         title="确认删除"

@@ -11,7 +11,7 @@
  * <LogsDrawer visible={visible} onClose={onClose} />
  */
 import { useState, useEffect, useCallback } from 'react';
-import { Drawer, Input, Select, Table, Tag, Pagination, Empty } from 'antd';
+import { Drawer, Input, Select, Table, Tag, Pagination, Empty, theme } from 'antd';
 import type { LogEntry } from '../types';
 import { api } from '../api';
 
@@ -37,6 +37,7 @@ const ACTION_TYPE_OPTIONS = [
 const PAGE_SIZE = 100;
 
 export default function LogsDrawer({ visible, onClose }: LogsDrawerProps) {
+  const { token } = theme.useToken();
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -87,7 +88,7 @@ export default function LogsDrawer({ visible, onClose }: LogsDrawerProps) {
     {
       title: '操作', dataIndex: 'action', key: 'action', width: 110,
       render: (action: string) => (
-        <span style={{ color: /删除|失败/.test(action) ? '#f5222d' : undefined }}>{action}</span>
+        <span style={{ color: /删除|失败/.test(action) ? token.colorError : undefined }}>{action}</span>
       ),
     },
     { title: '项目/对象', dataIndex: 'target', key: 'target' },
