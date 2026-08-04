@@ -221,19 +221,19 @@ graph TD
   - 每次登录处理写审计（时间、账号、来源地址、结果四类），不含密码明文
   - _Requirements: 9.1, 9.2, 9.4, 9.5, 9.6, 9.7, 9.8, 9.9, 9.10, 9.11, 9.12_
 
-- [ ] 13. 实现形态 B 的网关协作与域隔离
-- [ ] 13.1 校验端点与跳转流程
+- [x] 13. 实现形态 B 的网关协作与域隔离
+- [x] 13.1 校验端点与跳转流程
   - 新增 `GET /auth/verify`：200 时回 `X-Auth-User-Id` 与 `X-Auth-User-Name` 响应头，姓名先 UTF-8 再百分号编码、不超过 256 字节且按完整编码序列截断
   - 新增 `GET /auth/handoff`（管理域签发 60 秒一次性跳转凭证，`jti` 落库）与 `GET /auth/preview-entry`（预览域消费凭证后签发独立会话并立即失效该凭证）
   - 跳转凭证签名失败/过期/已用 → 不签发会话并 302 回管理域登录入口
   - 会话所属域与请求域不一致时 401 且不刷新活跃时间
   - 管理域与预览域使用不同 Cookie 名与不同会话记录
   - _Requirements: 2.6, 2.8, 2.11, 4.6, 4.7, 4.8, 4.9, 4.10, 4.11_
-- [ ] 13.2 预览域 URL 与沙箱降级
+- [x] 13.2 预览域 URL 与沙箱降级
   - 项目列表响应的访问链接改为绝对 URL，主机名取自 `PREVIEW_ORIGIN` 配置而非请求 `Host` 头
   - `embedded` 模式下对 `/files/*`、`/protected/*`、`/versions/*` 响应加 `Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups`，由 `PREVIEW_SANDBOX` 开关控制
   - _Requirements: 4.12_
-- [ ] 13.3 Nginx 配置样例
+- [x] 13.3 Nginx 配置样例
   - 新建 `deploy/nginx.conf.example`：`underscores_in_headers off`、`proxy_set_header X-Auth-* ""` 头清洗、`auth_request` 内部端点、2 秒超时与非 200/401 一律 503 的 fail-closed
   - 管理域：仅提供管理界面与 `/api/*`，`/files|versions|protected/` 返回 404，`/api/*` 不设允许预览域来源的跨域头
   - 预览域：仅代理 `/files|versions|protected|auth/`，`/api/*` 返回 403，非 GET/HEAD 返回 405，其余路径 404，响应加 `X-Content-Type-Options: nosniff`
@@ -257,15 +257,15 @@ graph TD
   - 授权流程失败写审计（失败时间、所处环节、来源 IP、飞书错误码），不含任何凭据
   - _Requirements: 13.1, 13.2, 13.3, 13.4, 13.5, 13.6_
 
-- [ ] 16. 编写单元测试与属性测试
-- [ ] 16.1 单元测试
+- [x] 16. 编写单元测试与属性测试
+- [x] 16.1 单元测试
   - 新建 `server/tests/`，配置 pytest
   - 签名凭证：篡改 payload、篡改签名、过期、`pv` 变更后失效
   - 会话过期边界：空闲等于 604800 秒有效、大于无效；当前时间等于绝对过期时间有效、大于无效
   - `state` 一次性：同一 `state` 第二次回调返回 400
   - 应急通道：非回环来源 403、限流窗口行为、60 分钟不续期
   - _Requirements: 3.8, 3.9, 1.4, 9.2, 9.6, 9.8_
-- [ ] 16.2 属性测试
+- [x] 16.2 属性测试
   - Property 1 伪造身份头无效：随机生成 `X-Auth-*` / `X_Auth_*` 头组合（含大小写变体），两种模式下身份判定结果均不受影响
   - Property 2 权限判定等价式与 Property 3 IP 无关性：随机项目与操作者组合验证真值表，随机改动 `uploader_ip` 结果不变
   - Property 4 迁移幂等与字段保全：随机生成 `metadata.json` 结构，验证两次迁移结果一致且非 `owner_*` 字段全部保留
@@ -276,18 +276,18 @@ graph TD
   - Property 10 域会话不互通
   - Property 11 失败请求不留痕：对随机的 4xx/5xx 写请求，比对 `metadata.json`、`webapps/`、`versions/` 前后一致
   - _Requirements: 2.7, 2.9, 5.6, 5.8, 5.14, 5.15, 7.1, 7.2, 7.3, 7.5, 10.10, 12.5, 14.9, 4.11_
-- [ ] 16.3 安全回归清单
+- [x] 16.3 安全回归清单
   - 编写可重复执行的脚本，覆盖：伪造身份头、绕过网关直连、`X-Admin-Token` 已失效、预览域拒 `/api/*` 与非 GET/HEAD、管理域拒 `/files/*`、跳转凭证重放
   - _Requirements: 2.9, 2.15, 4.3, 4.4, 4.5, 4.10_
 
-- [ ] 17. 同步文档与版本记录
+- [x] 17. 同步文档与版本记录
   - 更新 `PRD.md` 2.8 节权限矩阵，覆盖项目负责人、普通管理员、超级管理员、其他已认证用户四类角色在六类管理操作与三类读取操作上的判定结果
   - 更新 `PRD.md` 的技术架构、API 清单、数据结构、部署说明章节；移除文档中的默认超管密码
   - `README.md` 补充飞书应用配置步骤与环境变量说明
   - 执行 `python3 server/changelog.py "<摘要>" security` 记录版本
   - _Requirements: 7.9_
 
-- [ ] 18. 处理多 worker 部署的衔接点
+- [x] 18. 处理多 worker 部署的衔接点
   - 应急通道后台线程在多 worker 下会各起一份，改为仅主 worker 启动或独立进程运行，并在 `deploy/` 说明中记录
   - 复核会话存储的跨进程文件锁在多 worker 下的正确性
   - _Requirements: 9.1, 3.1_

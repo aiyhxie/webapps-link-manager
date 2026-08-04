@@ -1,0 +1,214 @@
+# 原型极速分享平台 —— Nginx 配置样例（形态 B：网关模式）
+#
+# 用法：把 <域名> 替换成实际域名，证书路径替换成实际路径，然后
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# 对应的应用侧配置（.env）：
+#   AUTH_MODE=gateway
+#   DEPLOY_ENV=production
+#   ADMIN_ORIGIN=https://app.<域名>
+#   PREVIEW_ORIGIN=https://preview.<域名>
+#   TRUSTED_GATEWAY_IPS=127.0.0.1,::1
+#   AUTH_SIGNING_SECRET=<用 python3 -c "import secrets;print(secrets.token_urlsafe(32))" 生成>
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# 这份配置里有三处是安全要害，改动前请先理解：
+#
+# 1. underscores_in_headers off（默认值，这里显式写出以防被全局配置改掉）
+#    Nginx 默认丢弃带下划线的请求头。若开成 on，客户端就能发 X_Auth_User_Id，
+#    它会被规整成 X-Auth-User-Id 传给后端 —— 等于绕过第 2 条的清洗。
+#
+# 2. proxy_set_header X-Auth-* ""
+#    必须显式清空，否则客户端传入的同名头会原样转发给后端，任何人加个头就能
+#    冒充任意员工。这与改造前 get_client_ip() 无条件信任 X-Forwarded-For
+#    是同一类漏洞，务必不要重犯。
+#
+# 3. auth_request 的 fail-closed
+#    校验端点超时或返回非 200/401 时一律 503，绝不放行。
+#
+# 应用侧还有一道独立防线：只有对端地址在 TRUSTED_GATEWAY_IPS 内时才采信
+# X-Auth-* 头。两道防线互不依赖，任一生效即可挡住伪造。
+# ─────────────────────────────────────────────────────────────────────────────
+
+upstream webapps_backend {
+    server 127.0.0.1:8080;
+    keepalive 16;
+}
+
+# 要害 1：不要改成 on
+underscores_in_headers off;
+
+# 通用代理头
+proxy_http_version 1.1;
+
+map $http_accept $wants_html {
+    default            0;
+    "~*text/html"      1;
+}
+
+# ── HTTP 全部跳 HTTPS ────────────────────────────────────────────────────────
+server {
+    listen 80;
+    listen [::]:80;
+    server_name app.<域名> preview.<域名>;
+    return 301 https://$host$request_uri;
+}
+
+# ── 管理域：管理界面 + 全部 /api/* ───────────────────────────────────────────
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name app.<域名>;
+
+    ssl_certificate     /etc/letsencrypt/live/app.<域名>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/app.<域名>/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 100m;   # 与应用的 MAX_CONTENT_LENGTH 保持一致
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # 认证子请求端点（仅内部可调）
+    location = /auth/verify {
+        internal;
+        proxy_pass              http://webapps_backend;
+        proxy_pass_request_body off;
+        proxy_set_header        Content-Length "";
+        proxy_set_header        Host $host;
+        proxy_set_header        X-Real-IP $remote_addr;
+        # 要害 2：子请求同样要清洗
+        proxy_set_header        X-Auth-User-Id "";
+        proxy_set_header        X-Auth-User-Name "";
+        # 要害 3：fail-closed
+        proxy_read_timeout      2s;
+        proxy_connect_timeout   2s;
+    }
+
+    # /auth/* 与健康检查免认证 —— 否则登录本身无法进行
+    location ^~ /auth/ {
+        proxy_pass       http://webapps_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Auth-User-Id "";
+        proxy_set_header X-Auth-User-Name "";
+    }
+
+    # 原型内容不在管理域提供 —— 否则上传的 HTML 与管理界面同源，
+    # 域名隔离就白做了
+    location ~ ^/(files|versions|protected)/ {
+        return 404;
+    }
+
+    location / {
+        auth_request     /auth/verify;
+        auth_request_set $auth_user_id   $upstream_http_x_auth_user_id;
+        auth_request_set $auth_user_name $upstream_http_x_auth_user_name;
+
+        proxy_pass       http://webapps_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # 注入身份：取值只来自校验响应，不与客户端头合并
+        proxy_set_header X-Auth-User-Id   $auth_user_id;
+        proxy_set_header X-Auth-User-Name $auth_user_name;
+
+        error_page 401 = @handle_401;
+    }
+
+    # HTML 请求 302 到登录并带回跳；其余 401
+    location @handle_401 {
+        if ($wants_html) {
+            return 302 /auth/login?return_to=$request_uri;
+        }
+        return 401;
+    }
+}
+
+# ── 预览域：只提供原型内容，拒绝一切写操作 ───────────────────────────────────
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name preview.<域名>;
+
+    ssl_certificate     /etc/letsencrypt/live/preview.<域名>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/preview.<域名>/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # 原型是用户上传的任意 HTML，nosniff 必须始终带上
+    add_header X-Content-Type-Options nosniff always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # 只读：非 GET/HEAD 一律拒绝，与路径和认证状态无关
+    if ($request_method !~ ^(GET|HEAD)$) {
+        return 405;
+    }
+
+    # 预览域绝不暴露写接口。放在最前面，优先级高于下面的白名单
+    location ^~ /api/ {
+        return 403;
+    }
+
+    location = /auth/verify {
+        internal;
+        proxy_pass              http://webapps_backend;
+        proxy_pass_request_body off;
+        proxy_set_header        Content-Length "";
+        proxy_set_header        Host $host;
+        proxy_set_header        X-Auth-User-Id "";
+        proxy_set_header        X-Auth-User-Name "";
+        proxy_read_timeout      2s;
+        proxy_connect_timeout   2s;
+    }
+
+    # 跳转凭证的落地路径，免认证
+    location ^~ /auth/ {
+        proxy_pass       http://webapps_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Auth-User-Id "";
+        proxy_set_header X-Auth-User-Name "";
+    }
+
+    location ~ ^/(files|versions|protected)/ {
+        auth_request     /auth/verify;
+        auth_request_set $auth_user_id   $upstream_http_x_auth_user_id;
+        auth_request_set $auth_user_name $upstream_http_x_auth_user_name;
+
+        proxy_pass       http://webapps_backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Auth-User-Id   $auth_user_id;
+        proxy_set_header X-Auth-User-Name $auth_user_name;
+
+        # 未认证时把用户送去管理域完成授权，再带凭证回来
+        error_page 401 = @to_handoff;
+    }
+
+    location @to_handoff {
+        return 302 https://app.<域名>/auth/handoff?to=$request_uri;
+    }
+
+    # 白名单之外一律 404
+    location / {
+        return 404;
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 应急管理员通道（127.0.0.1:8099）刻意不在此文件中出现。
+# 它只绑回环地址，配置成对外可达会导致应用拒绝启动。需要使用时先 SSH 到服务器，
+# 再从本机浏览器或 SSH 端口转发访问：
+#   ssh -L 8099:127.0.0.1:8099 user@server
+# 然后本地打开 http://127.0.0.1:8099/emergency/login
+# ─────────────────────────────────────────────────────────────────────────────

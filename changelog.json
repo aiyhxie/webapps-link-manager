@@ -1,6 +1,12 @@
 {
-  "last_recorded_version": "1.0.22",
+  "last_recorded_version": "1.0.23",
   "entries": [
+    {
+      "version": "1.0.23",
+      "date": "2026-08-04T22:24:03.870873",
+      "changelog": "接入飞书扫码登录(SSO)并把项目所有权从IP迁移到飞书账号：1. 飞书OAuth授权码登录，会话持久化到auth_sessions.json，重启不掉线，空闲7天/绝对30天过期；2. 客户端伪造的X-Auth-*头永不影响身份判定(embedded形态在WSGI层删除、gateway形态先校验可信网关对端)，杜绝重犯X-Forwarded-For那类漏洞；3. 权限判定改为canManage(负责人本人或管理员)，uploader_ip降级为纯审计信息且在权限模块中完全不出现；file_manager改为必传allowed布尔值，漏判会报TypeError而非静默放行；4. 移除localStorage里的管理员token与X-Admin-Token，凭据只走HttpOnly Cookie，杜绝上传的HTML原型窃取管理凭据；5. 项目新增owner_id/owner_name，迁移脚本幂等且备份先行；超管可批量指定存量项目负责人；6. 管理员名单改以飞书UserID为主键，首个通过飞书应用管理员校验的登录者自动成为超管；7. 新增仅绑回环地址的应急管理员通道(60分钟固定有效期、滑动窗口限流)，配成对外可达则拒绝启动；8. 项目访问凭证改为无状态签名并绑定密码版本，密码一改旧凭证立即失效；9. 审计日志新增actor_id/actor_name稳定身份主键并保持历史记录兼容；10. 前端侧边栏改为按负责人分组、卡片展示负责人取代IP；11. 交付Nginx双域名隔离配置样例(管理域拒原型内容、预览域拒/api与非GET)；12. 新增67项单元/属性测试与17项安全回归脚本，属性测试发现并修复了姓名头截断切断多字节UTF-8序列的真实bug",
+      "type": "security"
+    },
     {
       "version": "1.0.22",
       "date": "2026-08-04T11:23:51.650898",

@@ -119,18 +119,19 @@ def encode_user_name(name: str) -> str:
     """
     把姓名编码成可安全放进 HTTP 头的 ASCII（需求 2.11）。
 
-    先 UTF-8 再百分号编码，并保证截断发生在完整编码序列边界上，
-    不产生残缺的 %E4 这种半个字符。
+    先 UTF-8 再百分号编码，编码后不超过 256 字节，且截断必须落在**字符**边界上。
+
+    为什么不在编码后的字符串上按字节裁剪：一个中文字符编码成 `%E8%B0%A2`（9 个
+    字符、3 个字节），emoji 更长。在编码串上裁剪即使避开了 `%XX` 三元组，也可能
+    把一个多字节 UTF-8 序列切成两半，解码时直接抛 UnicodeDecodeError。所以改为
+    从原字符串尾部逐字符回退，编码后长度达标即止 —— 这样得到的一定是完整字符。
     """
-    encoded = urllib.parse.quote((name or "").encode("utf-8"), safe="")
-    if len(encoded) <= 256:
-        return encoded
-    cut = 256
-    while cut > 0 and encoded[cut - 1] == "%":
-        cut -= 1
-    while cut > 1 and encoded[cut - 2] == "%":
-        cut -= 2
-    return encoded[:cut]
+    text = name or ""
+    encoded = urllib.parse.quote(text.encode("utf-8"), safe="")
+    while len(encoded) > 256 and text:
+        text = text[:-1]
+        encoded = urllib.parse.quote(text.encode("utf-8"), safe="")
+    return encoded
 
 
 def decode_user_name(value: str, fallback: str) -> str:

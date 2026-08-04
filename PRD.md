@@ -132,27 +132,62 @@ WebApps Link Manager 是一款面向企业内网的 HTML 文件分享与管理�
 - 若当前用户对此项目无编辑权限（`canDelete == false`），引导层文字变为"暂无编辑此项目的权限"
 - 释放鼠标后：无权限则 Toast 提示`{卡片标题}：暂无编辑权限`，有权限则上传成功并 Toast 提示`{卡片标题} Vx 版本更新成功`
 
-**权限判断**（统一标准）：
+**权限判断**（改造后：基于飞书身份，不再看 IP）：
 
-| 操作 | 权限要求 |
-|------|---------|
-| 上传新版本 | `canDelete == true`（上传者 IP 或管理员） |
-| 编辑卡片信息（标题/描述/产品线/密码） | `canDelete == true` |
-| 删除文件 | `canDelete == true` |
-| 删除历史版本 | `canDelete == true` |
-| 恢复旧版本为当前 | `canDelete == true` |
-| 查看版本历史列表 | **无需权限**（任何人可见） |
-| 预览历史版本 | **无需权限** |
-| 访问当前版本（无密码） | **无需权限** |
-| 访问历史版本（有密码保护） | **已认证 Cookie 有效** |
+`canManage` 取代原来的 `canDelete`，判定式为：
+
+```
+canManage = 是管理员 or (项目有负责人 and 负责人就是当前操作者)
+```
+
+| 操作 | 项目负责人 | 普通管理员 | 超级管理员 | 其他已认证员工 |
+|------|:---:|:---:|:---:|:---:|
+| 编辑卡片信息（标题/描述/产品线） | ✅ | ✅ | ✅ | ❌ |
+| 设置/清除项目访问密码 | ✅ | ✅ | ✅ | ❌ |
+| 上传新版本 | ✅ | ✅ | ✅ | ❌ |
+| 恢复历史版本 | ✅ | ✅ | ✅ | ❌ |
+| 删除历史版本 | ✅ | ✅ | ✅ | ❌ |
+| 删除项目 | ✅ | ✅ | ✅ | ❌ |
+| 上传新项目 | ✅ | ✅ | ✅ | ✅ |
+| 查看项目列表 | ✅ | ✅ | ✅ | ✅ |
+| 查看版本历史 | ✅ | ✅ | ✅ | ✅ |
+| 预览历史版本 | ✅ | ✅ | ✅ | ✅ |
+| 查看系统日志 | ❌ | ✅ | ✅ | ❌ |
+| 指定项目负责人 | ❌ | ❌ | ✅ | ❌ |
+| 维护管理员名单 | ❌ | ❌ | ✅ | ❌ |
+
+**无负责人的项目**（`owner_id` 为空）对任意非管理员一律不可管理。这与改造前
+「`uploader_ip` 为空则任何人可编辑」的旧语义相反，是有意的收紧。存量项目在
+超管指定负责人之前都属于这种状态。
 
 **权限实现要点**：
-- `canDelete == true` 的判定 = 上传者 IP 匹配 **或** 已登录管理员（超级/普通管理员一致，对所有项目拥有全部操作权限）
-- 前端所有写请求必须携带 `X-Admin-Token`，否则后端看不到管理员会话，会按 IP 判定而拒绝，且审计日志的操作者会记成 IP 而非管理员姓名
-- 后端对编辑信息、设置密码、上传新版本、恢复版本、删除版本、删除项目**逐个强制校验**权限，不依赖前端隐藏按钮
-- 无权限用户在版本历史中不显示「恢复此版本」「删除 Vx」入口，只保留「预览」
-- 历史遗留文件（无 metadata 或 `uploader_ip` 为空）视为无 IP 限制，保持可编辑
-- 管理员对项目的所有改动都会记入审计日志，`actor` 为管理员姓名、`ip` 为其来源 IP
+- 身份来自飞书扫码登录，`owner_id` 存飞书 UserID；`uploader_ip` 保留但**降级为
+  纯审计信息**，不参与任何权限判定
+- `permissions.can_manage()` 是唯一判定入口，该模块里根本不出现 `uploader_ip`，
+  从结构上保证它不可能被误用
+- 文件操作层（`file_manager`）不再自行判权，权限以必传的 `allowed` 布尔值传入，
+  漏判会变成 TypeError 而不是静默放行
+- 六类写操作每次请求都重新计算 `canManage`，不采纳请求体里的任何权限字段
+- 前端凭据只走 HttpOnly Cookie，不再有 `X-Admin-Token`，也不往 localStorage 存任何东西
+- 客户端传入的 `X-Auth-*` 头永不影响身份判定：embedded 形态在 WSGI 层删除，
+  gateway 形态先校验对端是否可信网关
+- 无权限用户在版本历史中不显示「恢复此版本」「删除 Vx」，只保留「预览」
+
+### 2.9 身份认证（飞书 SSO）
+
+| 功能 | 说明 |
+|------|------|
+| 飞书扫码登录 | 企业自建应用，OAuth 授权码流程，`open_id` 作为身份主键 |
+| 会话保持 | 持久化到 `auth_sessions.json`，服务重启不掉线；空闲 7 天 / 绝对 30 天过期 |
+| 首个超管 | 管理员名单为空时，首个通过飞书应用管理员校验的登录者自动成为超管 |
+| 管理员名单 | 存 `metadata.json` 的 `_system_admin_list_`，之后与飞书接口解耦 |
+| 用户档案 | 登录过的用户记入 `_system_users_`，是「指定负责人」「加管理员」的候选来源 |
+| 应急通道 | 用户名密码登录，仅绑回环地址，60 分钟固定有效期，飞书故障时兜底 |
+| 双域隔离 | 生产环境管理域承载 `/api/*`，预览域只放原型内容，防上传的 HTML 偷凭据 |
+
+**最小权限**：只申请了「获取用户基本信息」「校验用户是否为应用管理员」
+「获取应用管理员 ID」三项，**未申请通讯录读取**。代价是同事必须先登录一次才能
+被指定为负责人或管理员。
 
 #### 版本 URL 设计
 
@@ -199,8 +234,9 @@ WebApps Link Manager 是一款面向企业内网的 HTML 文件分享与管理�
 | 后端 | Python Flask |
 | 前端 | React + TypeScript + Vite |
 | UI 组件 | Ant Design |
-| 数据存储 | JSON 文件 (metadata.json) |
-| 日志存储 | 文本文件 (logs/webapps.log) |
+| 身份认证 | 飞书开放平台 OAuth（标准库 urllib 实现，无第三方依赖） |
+| 数据存储 | JSON 文件 (metadata.json / auth_sessions.json，原子写入+文件锁) |
+| 日志存储 | JSON Lines (logs/audit.jsonl) |
 
 ### 3.2 目录结构
 
@@ -230,18 +266,29 @@ WebApps Link Manager 是一款面向企业内网的 HTML 文件分享与管理�
 
 ### 3.3 API 设计
 
-#### 管理员接口
+#### 认证接口
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/admin/status` | 获取登录状态 |
-| POST | `/api/admin/setup` | 创建首个管理员 |
-| POST | `/api/admin/login` | 管理员登录 |
-| POST | `/api/admin/logout` | 管理员登出 |
-| GET | `/api/admin/users` | 获取管理员列表 |
-| POST | `/api/admin/users` | 添加管理员 |
-| DELETE | `/api/admin/users/<username>` | 删除管理员 |
-| POST | `/api/admin/password` | 修改密码 |
+| GET | `/auth/login` | 未登录则跳飞书授权页，已登录直接回跳 |
+| GET | `/auth/feishu/callback` | 飞书回调：校验 state、换令牌、建档、签发会话 |
+| POST | `/auth/logout` | 退出登录（只删当前域会话） |
+| GET | `/auth/verify` | 网关 `auth_request` 校验端点（仅 gateway 形态） |
+| GET | `/auth/handoff` | 管理域签发跨域跳转凭证 |
+| GET | `/auth/preview-entry` | 预览域消费跳转凭证 |
+| GET | `/auth/health` | 健康检查（免认证） |
+| GET | `/emergency/login` | 应急管理员登录（仅回环地址，独立端口） |
+
+#### 身份与管理员接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/me` | 当前登录者身份与权限 |
+| GET | `/api/users` | 用户档案列表（选人用） |
+| GET | `/api/admins` | 管理员名单 |
+| POST | `/api/admins` | 添加普通管理员（超管） |
+| DELETE | `/api/admins/<user_id>` | 移除管理员（超管） |
+| POST | `/api/projects/owner` | 批量指定项目负责人（超管） |
 
 #### 文件接口
 
@@ -280,6 +327,8 @@ WebApps Link Manager 是一款面向企业内网的 HTML 文件分享与管理�
   "file:example.html": {
     "title": "示例页面",
     "description": "这是一个示例",
+    "owner_id": "ou_xxxxxxxxxxxx",
+    "owner_name": "谢勇华",
     "uploader_ip": "192.168.1.100",
     "upload_time": "2026-06-26T17:00:00",
     "original_name": "example.html",
@@ -292,11 +341,25 @@ WebApps Link Manager 是一款面向企业内网的 HTML 文件分享与管理�
       "V3": { "upload_time": "2026-06-28T09:00:00", "uploader_ip": "192.168.1.100" }
     }
   },
+  "_system_users_": {
+    "ou_xxxxxxxxxxxx": {
+      "name": "谢勇华",
+      "first_login_at": "2026-08-04T22:00:00",
+      "last_login_at": "2026-08-04T22:30:00"
+    }
+  },
+  "_system_admin_list_": {
+    "ou_xxxxxxxxxxxx": {
+      "name": "谢勇华",
+      "level": "super",
+      "created_at": "2026-08-04T22:00:00"
+    }
+  },
   "_system_admins_": {
     "users": [
       {
-        "username": "admin",
-        "password_hash": "sha256哈希值",
+        "username": "应急账号",
+        "password_hash": "bcrypt 哈希",
         "created_at": "2026-06-26T17:00:00"
       }
     ]
@@ -305,6 +368,11 @@ WebApps Link Manager 是一款面向企业内网的 HTML 文件分享与管理�
 ```
 
 **说明**：
+- `owner_id` / `owner_name`：项目负责人的飞书 UserID 与姓名快照，权限判定的依据
+- `uploader_ip`：来源 IP，**仅供审计展示**，不参与权限判定
+- `_system_users_`：用户档案，登录过本系统的人
+- `_system_admin_list_`：管理员名单，以飞书 UserID 为主键，`level` 取 `super`/`normal`
+- `_system_admins_`：用途已收窄为**应急管理员通道专用**，不参与飞书登录的权限判定
 - `current_version`：当前版本号，如 `"V3"`
 - `versions`：所有版本记录，Key 为版本号，Value 包含 `upload_time` 和 `uploader_ip`
 - 物理文件始终只有一份（当前版本），历史版本内容在上传新版本时存档保存
@@ -348,8 +416,12 @@ cd server && python3 app.py
 
 ### 4.3 初始配置
 
-1. 首次访问时创建超级管理员账户
-2. 默认超级管理员：谢勇华 / xyh123456
+1. 复制 `.env.example` 为 `.env`，填入飞书 App ID 与 App Secret
+2. 运行 `python3 server/migrate_identity.py`（幂等，可重复执行）
+3. 启动服务后用飞书扫码登录；首个通过飞书应用管理员校验的登录者自动成为超级管理员
+4. 超管登录后在「指定负责人」里为存量项目补上归属
+
+详细部署步骤见 `deploy/README.md`，Nginx 配置见 `deploy/nginx.conf.example`。
 
 ---
 
@@ -403,6 +475,7 @@ curl -s "http://localhost:8080/api/admin/login" -X POST -H "Content-Type: applic
 
 | 版本 | 日期 | 类型 | 变更说明 |
 |------|------|------|---------|
+| 1.0.23 | 2026-08-04 | security | 接入飞书扫码登录(SSO)并把项目所有权从IP迁移到飞书账号：1. 飞书OAuth授权码登录，会话持久化到auth_sessions.json，重启不掉线，空闲7天/绝对30天过期；2. 客户端伪造的X-Auth-*头永不影响身份判定(embedded形态在WSGI层删除、gateway形态先校验可信网关对端)，杜绝重犯X-Forwarded-For那类漏洞；3. 权限判定改为canManage(负责人本人或管理员)，uploader_ip降级为纯审计信息且在权限模块中完全不出现；file_manager改为必传allowed布尔值，漏判会报TypeError而非静默放行；4. 移除localStorage里的管理员token与X-Admin-Token，凭据只走HttpOnly Cookie，杜绝上传的HTML原型窃取管理凭据；5. 项目新增owner_id/owner_name，迁移脚本幂等且备份先行；超管可批量指定存量项目负责人；6. 管理员名单改以飞书UserID为主键，首个通过飞书应用管理员校验的登录者自动成为超管；7. 新增仅绑回环地址的应急管理员通道(60分钟固定有效期、滑动窗口限流)，配成对外可达则拒绝启动；8. 项目访问凭证改为无状态签名并绑定密码版本，密码一改旧凭证立即失效；9. 审计日志新增actor_id/actor_name稳定身份主键并保持历史记录兼容；10. 前端侧边栏改为按负责人分组、卡片展示负责人取代IP；11. 交付Nginx双域名隔离配置样例(管理域拒原型内容、预览域拒/api与非GET)；12. 新增67项单元/属性测试与17项安全回归脚本，属性测试发现并修复了姓名头截断切断多字节UTF-8序列的真实bug |
 | 1.0.22 | 2026-08-04 | security | 权限体系修复：1. 版本历史中无权限用户不再显示恢复此版本入口，与删除版本保持一致，仅保留预览；2. 修复管理员全量权限失效的问题：前端所有写接口(上传项目/上传新版本/编辑信息/设置密码/删除项目/恢复版本/删除版本)补上X-Admin-Token，此前后端看不到管理员会话导致按钮亮着但请求被403，且审计日志操作者记成IP而非管理员姓名；3. 后端delete_file/restore_version_file/delete_version_file增加is_admin参数并由路由透传，管理员不再被内层IP校验拦掉(此前delete_file路由取了admin_user却未使用)；4. 补上PUT /api/files/<key>缺失的权限校验，此前任何人可修改任意项目的标题/描述/产品线/密码；历史遗留文件(无metadata或uploader_ip为空)仍视为无IP限制保持可编辑 |
 | 1.0.21 | 2026-08-03 | security | 深色模式显示样式整体优化：1. ConfigProvider补上antd主题algorithm(深色darkAlgorithm/浅色defaultAlgorithm)，修复此前只覆盖token导致placeholder、关闭图标、分割线等派生色仍取浅色值、在深底上看不清的问题(影响登录页、编辑文件信息、设置密码、修改密码等所有输入框与抽屉)；2. 深色下额外提亮colorTextPlaceholder/colorTextDescription/colorIcon/colorSplit保证可读性；3. 版本更新日志抽屉去掉硬编码浅色值(#333/#555/#999/#f0f0f0)改用主题token，正文在深色下清晰可读；4. 系统日志抽屉红色文案与主题切换勾选图标改为主题感知取色 |
 | 1.0.20 | 2026-08-03 | feature | 1. 新增上传进度条：上传接口改用XMLHttpRequest上报进度，新项目上传在上传卡片内显示进度条、版本更新在对应项目卡片顶部显示进度条，字节发送完成后显示处理中状态；2. 去掉上传新项目时同名自动升版本的逻辑：通过上传新项目入口一律创建新项目，重名时文件名/目录名与标题同步追加数字后缀(1、2、3…)；3. 顺带修复ZIP同名上传会合并覆盖已有项目目录并清空其版本历史的问题，以及ZIP顶层目录名未做路径穿越校验的问题 |
