@@ -5,11 +5,12 @@
  * - 文件列表展示：自动扫描 webapps 目录下所有 HTML 文件
  * - 文件上传：支持 HTML 和 ZIP 文件上传（拖拽或点击）
  * - 文件编辑：编辑标题、描述、产品线
- * - 文件删除：基于 IP 的权限控制（上传者或管理员可删除）
+ * - 文件删除：基于飞书身份的权限控制（项目负责人或管理员）
  * - 密码保护：可为文件设置访问密码
- * - 管理员系统：超级管理员可管理其他管理员、查看日志
+ * - 身份认证：飞书扫码登录，凭据只走 HttpOnly Cookie，前端不保存 token
+ * - 管理员系统：超级管理员可维护管理员名单、指定项目负责人、查看日志
  * - 主题切换：支持浅色、深色、自动跟随系统三种模式
- * - 产品线筛选：支持按产品线和上传者筛选文件
+ * - 产品线筛选：支持按产品线和负责人筛选文件
  *
  * 组件结构：
  * - App.tsx: 主组件，包含所有业务逻辑（已整合所有功能）
@@ -17,16 +18,16 @@
  * - components/PasswordModal.tsx: 设置/修改密码弹窗
  */
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { ConfigProvider, Layout, Typography, message, Input, Button, Space, Card, Empty, Tooltip, Popconfirm, Drawer, Badge, Dropdown, MenuProps, Form, Progress, theme as antdTheme } from 'antd';
+import { ConfigProvider, Layout, Typography, message, Input, Button, Space, Card, Empty, Tooltip, Popconfirm, Drawer, Badge, Dropdown, MenuProps, Progress, Select, theme as antdTheme } from 'antd';
 import { SearchOutlined, CopyOutlined, EditOutlined, DeleteOutlined, DesktopOutlined, GlobalOutlined, MenuOutlined, AppstoreOutlined, SunOutlined, MoonOutlined, MoreOutlined, PlusOutlined, CheckOutlined, LockOutlined, UnlockOutlined, InboxOutlined, UserOutlined, LogoutOutlined, TeamOutlined, KeyOutlined, FileTextOutlined, DownOutlined } from '@ant-design/icons';
 import EditModal from './components/EditModal';
 import PasswordModal from './components/PasswordModal';
 import ChangelogModal from './components/ChangelogModal';
 import LogsDrawer from './components/LogsDrawer';
-import ChangePasswordDrawer from './components/ChangePasswordDrawer';
-import type { FileInfo, ChangelogEntry } from './types';
+import OwnerAssignDrawer from './components/OwnerAssignDrawer';
+import type { FileInfo, ChangelogEntry, CurrentUser, AdminEntry, DirectoryUser, VersionInfo } from './types';
 import { PRODUCT_LINES } from './types';
-import { api, setAdminToken, clearAdminToken } from './api';
+import { api, clearLegacyCredentials } from './api';
 
 type SortMode = 'init_desc' | 'init_asc' | 'update_desc' | 'update_asc' | 'product_line' | 'ip';
 
@@ -88,7 +89,7 @@ function App() {
   const [version, setVersion] = useState('');
   const [loading, setLoading] = useState(true);
   const [searchText, setSearchText] = useState('');
-  const [selectedIp, setSelectedIp] = useState<string | null>(null);
+  const [selectedOwner, setSelectedOwner] = useState<string | null>(null);
   const [selectedProductLine, setSelectedProductLine] = useState<string | null>(null);
   const [editVisible, setEditVisible] = useState(false);
   const [editingFile, setEditingFile] = useState<FileInfo | null>(null);
@@ -97,7 +98,7 @@ function App() {
   const [passwordFile, setPasswordFile] = useState<FileInfo | null>(null);
   const [versionModalVisible, setVersionModalVisible] = useState(false);
   const [versionFile, setVersionFile] = useState<FileInfo | null>(null);
-  const [versionList, setVersionList] = useState<Record<string, { upload_time: string; uploader_ip: string }>>({});
+  const [versionList, setVersionList] = useState<Record<string, VersionInfo>>({});
   const [currentVersion, setCurrentVersion] = useState('');
 
   // Changelog state
@@ -127,18 +128,15 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const versionInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
-  // Admin state
-  const [adminLoggedIn, setAdminLoggedIn] = useState(false);
-  const [adminUsername, setAdminUsername] = useState('');
-  const [isSuperAdmin, setIsSuperAdmin] = useState(false);
-  const [hasAdmins, setHasAdmins] = useState(true);
-  const [adminLoginVisible, setAdminLoginVisible] = useState(false);
+  // 当前登录者（飞书身份）。null 表示尚未拉到 /api/me 结果
+  const [me, setMe] = useState<CurrentUser | null>(null);
   const [adminManageVisible, setAdminManageVisible] = useState(false);
-  const [adminSetupVisible, setAdminSetupVisible] = useState(false);
+  const [ownerAssignVisible, setOwnerAssignVisible] = useState(false);
   const [logsVisible, setLogsVisible] = useState(false);
-  const [changePasswordVisible, setChangePasswordVisible] = useState(false);
-  const [adminLoginForm] = Form.useForm();
-  const [adminSetupForm] = Form.useForm();
+  const [directoryUsers, setDirectoryUsers] = useState<DirectoryUser[]>([]);
+
+  const isAdmin = !!me?.isAdmin;
+  const isSuperAdmin = !!me?.isSuperAdmin;
 
   const getCurrentTheme = () => {
     if (themeMode === 'auto') {
@@ -198,20 +196,14 @@ function App() {
     loadChangelog();
   }, [loadFiles, loadChangelog]);
 
-  // Check admin status on load
+  // 拉取当前登录者。到得了这个页面就意味着已通过认证 ——
+  // 未登录的请求会被后端 302 到 /auth/login，根本不会渲染到这里。
+  // 同时清理浏览器里遗留的旧管理员 token（改造前存在 localStorage）。
   useEffect(() => {
-    const checkAdminStatus = async () => {
-      const result = await api.getAdminStatus();
-      if (result.success) {
-        setHasAdmins(result.hasAdmins ?? true);
-        if (result.isLoggedIn) {
-          setAdminLoggedIn(true);
-          setAdminUsername(result.username || '');
-          setIsSuperAdmin(result.isSuperAdmin || false);
-        }
-      }
-    };
-    checkAdminStatus();
+    clearLegacyCredentials();
+    api.getMe().then(res => {
+      if (res.success && res.data) setMe(res.data);
+    });
   }, []);
 
   useEffect(() => {
@@ -226,12 +218,27 @@ function App() {
     return () => mediaQuery.removeEventListener('change', handler);
   }, [themeMode]);
 
-  const uniqueIps = useMemo(() => {
-    const ips = new Set<string>();
+  /**
+   * 负责人分组。key 用 ownerId（稳定），展示用姓名。
+   * ownerId 为空的项目归入「未指定负责人」，并排在最后一位 ——
+   * 存量项目在超管指定负责人之前都会落在这一组。
+   */
+  const OWNERLESS = '__ownerless__';
+  const uniqueOwners = useMemo(() => {
+    const map = new Map<string, { id: string; name: string; count: number }>();
     files.forEach(f => {
-      if (f.uploader_ip) ips.add(f.uploader_ip);
+      const id = f.ownerId || OWNERLESS;
+      const name = f.ownerId ? (f.ownerName || f.ownerId) : '未指定负责人';
+      const hit = map.get(id);
+      if (hit) hit.count += 1;
+      else map.set(id, { id, name, count: 1 });
     });
-    return Array.from(ips).sort();
+    const list = Array.from(map.values());
+    return list.sort((a, b) => {
+      if (a.id === OWNERLESS) return 1;
+      if (b.id === OWNERLESS) return -1;
+      return a.name.localeCompare(b.name);
+    });
   }, [files]);
 
   const uniqueProductLines = useMemo(() => {
@@ -248,9 +255,10 @@ function App() {
         f.title.toLowerCase().includes(searchText.toLowerCase()) ||
         f.path.toLowerCase().includes(searchText.toLowerCase()) ||
         (f.description || '').toLowerCase().includes(searchText.toLowerCase());
-      const matchIp = !selectedIp || f.uploader_ip === selectedIp;
+      const matchOwner = !selectedOwner
+        || (selectedOwner === OWNERLESS ? !f.ownerId : f.ownerId === selectedOwner);
       const matchPl = !selectedProductLine || f.productLine === selectedProductLine;
-      return matchSearch && matchIp && matchPl;
+      return matchSearch && matchOwner && matchPl;
     });
 
     // Sort files
@@ -273,8 +281,8 @@ function App() {
           return (b.init_upload_time || '').localeCompare(a.init_upload_time || '');
         }
         case 'ip': {
-          const ipA = a.uploader_ip || '';
-          const ipB = b.uploader_ip || '';
+          const ipA = a.ownerName || '';
+          const ipB = b.ownerName || '';
           if (ipA !== ipB) {
             return ipA.localeCompare(ipB);
           }
@@ -286,7 +294,7 @@ function App() {
     });
 
     return result;
-  }, [files, searchText, selectedIp, selectedProductLine, sortMode]);
+  }, [files, searchText, selectedOwner, selectedProductLine, sortMode]);
 
   const handleUpload = async (file: File) => {
     if (newUpload) {
@@ -412,68 +420,68 @@ function App() {
     return `${upload.getFullYear()}年${month}月${day}日 ${hours}:${mins}上传`;
   };
 
-  const handleAdminLogin = async (values: { username: string; password: string }) => {
-    const result = await api.adminLogin(values.username, values.password);
-    if (result.success && result.token) {
-      setAdminToken(result.token);
-      setAdminLoggedIn(true);
-      setAdminUsername(result.username || '');
-      setIsSuperAdmin(result.isSuperAdmin || false);
-      setAdminLoginVisible(false);
-      adminLoginForm.resetFields();
-      message.success(`欢迎，${result.username}`);
-      loadFiles();
-    } else {
-      message.error(result.message || '登录失败');
-    }
+  const handleLogout = async () => {
+    await api.logout();
+    // 后端已清掉会话 Cookie，跳到登录入口重新走飞书授权
+    window.location.href = '/auth/login';
   };
 
-  const handleAdminLogout = async () => {
-    await api.adminLogout();
-    clearAdminToken();
-    setAdminLoggedIn(false);
-    setAdminUsername('');
-    setIsSuperAdmin(false);
-    message.success('已退出登录');
-    loadFiles();
-  };
-
-  const handleAdminSetup = async (values: { username: string; password: string }) => {
-    const result = await api.adminSetup(values.username, values.password);
-    if (result.success) {
-      message.success('管理员创建成功，请登录');
-      setAdminSetupVisible(false);
-      setHasAdmins(true);
-      adminSetupForm.resetFields();
-      setAdminLoginVisible(true);
-    } else {
-      message.error(result.message || '创建失败');
-    }
-  };
-
-  // Admin user list state for admin management modal
-  const [adminUsers, setAdminUsers] = useState<{ username: string; created_at: string }[]>([]);
+  // 管理员名单（以飞书 UserID 为主键）
+  const [adminUsers, setAdminUsers] = useState<AdminEntry[]>([]);
 
   const loadAdminUsers = useCallback(async () => {
-    const result = await api.getAdminUsers();
-    if (result.success && result.data) {
-      setAdminUsers(result.data);
-    }
+    const result = await api.getAdmins();
+    if (result.success && result.data) setAdminUsers(result.data);
+  }, []);
+
+  // 候选人只能来自已登录过本系统的用户 —— 走的是最小权限路线，
+  // 没有申请飞书通讯录读取权限，所以同事必须先登录一次才能被选中。
+  const loadDirectoryUsers = useCallback(async () => {
+    const result = await api.getDirectoryUsers();
+    if (result.success && result.data) setDirectoryUsers(result.data);
   }, []);
 
   useEffect(() => {
     if (adminManageVisible) {
       loadAdminUsers();
+      loadDirectoryUsers();
     }
-  }, [adminManageVisible, loadAdminUsers]);
+  }, [adminManageVisible, loadAdminUsers, loadDirectoryUsers]);
 
-  const handleDeleteAdmin = async (username: string) => {
-    const result = await api.deleteAdminUser(username);
+  useEffect(() => {
+    if (ownerAssignVisible) loadDirectoryUsers();
+  }, [ownerAssignVisible, loadDirectoryUsers]);
+
+  const handleDeleteAdmin = async (userId: string) => {
+    const result = await api.removeAdmin(userId);
     if (result.success) {
-      message.success('管理员已删除');
+      message.success(result.message || '管理员已删除');
       loadAdminUsers();
+      loadFiles();
     } else {
       message.error(result.message || '删除失败');
+    }
+  };
+
+  const handleAddAdmin = async (userId: string) => {
+    const result = await api.addAdmin(userId);
+    if (result.success) {
+      message.success(result.message || '已添加管理员');
+      loadAdminUsers();
+      loadFiles();
+    } else {
+      message.error(result.message || '添加失败');
+    }
+  };
+
+  const handleAssignOwner = async (keys: string[], ownerId: string) => {
+    const result = await api.assignOwner(keys, ownerId);
+    if (result.success) {
+      message.success(result.message || '已指定负责人');
+      setOwnerAssignVisible(false);
+      loadFiles();
+    } else {
+      message.error(result.message || '指定失败');
     }
   };
 
@@ -747,26 +755,26 @@ function App() {
         );
       })}
 
-      {/* Uploader Filter */}
+      {/* 负责人筛选 */}
       <div style={{ padding: '16px 16px 8px', marginTop: 8, borderTop: `1px solid ${borderColor}` }}>
         <Text style={{ color: textSecondary, fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.5, fontWeight: 500 }}>
-          上传者
+          负责人
         </Text>
       </div>
 
       <div
-        onClick={() => { setSelectedIp(null); setDrawerVisible(false); }}
+        onClick={() => { setSelectedOwner(null); setDrawerVisible(false); }}
         style={{
           padding: '8px 16px',
           cursor: 'pointer',
-          background: !selectedIp ? (currentTheme === 'dark' ? 'rgba(138,180,248,0.15)' : '#e8f0fe') : 'transparent',
-          color: !selectedIp ? (currentTheme === 'dark' ? '#8ab4f8' : '#4285f4') : textColor,
-          borderRadius: !selectedIp ? '0 8px 8px 0' : 0,
+          background: !selectedOwner ? (currentTheme === 'dark' ? 'rgba(138,180,248,0.15)' : '#e8f0fe') : 'transparent',
+          color: !selectedOwner ? (currentTheme === 'dark' ? '#8ab4f8' : '#4285f4') : textColor,
+          borderRadius: !selectedOwner ? '0 8px 8px 0' : 0,
           display: 'flex',
           alignItems: 'center',
           gap: 8,
           fontSize: 13,
-          fontWeight: !selectedIp ? 500 : 400,
+          fontWeight: !selectedOwner ? 500 : 400,
           marginLeft: -16,
           paddingLeft: 24,
         }}
@@ -776,30 +784,36 @@ function App() {
         <Badge count={files.length} style={{ backgroundColor: currentTheme === 'dark' ? '#5f6368' : '#dadce0', color: textSecondary, fontSize: 10 }} />
       </div>
 
-      {uniqueIps.map(ip => {
-        const count = files.filter(f => f.uploader_ip === ip).length;
+      {uniqueOwners.map(owner => {
+        const active = selectedOwner === owner.id;
+        const ownerless = owner.id === OWNERLESS;
         return (
           <div
-            key={ip}
-            onClick={() => { setSelectedIp(ip); setDrawerVisible(false); }}
+            key={owner.id}
+            /* 再次点击同一分组取消筛选 */
+            onClick={() => { setSelectedOwner(active ? null : owner.id); setDrawerVisible(false); }}
             style={{
               padding: '8px 16px',
               cursor: 'pointer',
-              background: selectedIp === ip ? (currentTheme === 'dark' ? 'rgba(138,180,248,0.15)' : '#e8f0fe') : 'transparent',
-              color: selectedIp === ip ? (currentTheme === 'dark' ? '#8ab4f8' : '#4285f4') : textColor,
-              borderRadius: selectedIp === ip ? '0 8px 8px 0' : 0,
+              background: active ? (currentTheme === 'dark' ? 'rgba(138,180,248,0.15)' : '#e8f0fe') : 'transparent',
+              color: active ? (currentTheme === 'dark' ? '#8ab4f8' : '#4285f4') : (ownerless ? textSecondary : textColor),
+              borderRadius: active ? '0 8px 8px 0' : 0,
               display: 'flex',
               alignItems: 'center',
               gap: 8,
               fontSize: 13,
-              fontWeight: selectedIp === ip ? 500 : 400,
+              fontWeight: active ? 500 : 400,
               marginLeft: -16,
               paddingLeft: 24,
             }}
           >
-            <DesktopOutlined />
-            <span style={{ flex: 1, fontFamily: 'monospace', fontSize: 12 }}>{ip}</span>
-            <Badge count={count} style={{ backgroundColor: currentTheme === 'dark' ? '#5f6368' : '#dadce0', color: textSecondary, fontSize: 10 }} />
+            {ownerless ? <InboxOutlined /> : <UserOutlined />}
+            <Tooltip title={owner.name.length > 20 ? owner.name : ''}>
+              <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {owner.name.length > 20 ? owner.name.slice(0, 20) + '…' : owner.name}
+              </span>
+            </Tooltip>
+            <Badge count={owner.count} style={{ backgroundColor: currentTheme === 'dark' ? '#5f6368' : '#dadce0', color: textSecondary, fontSize: 10 }} />
           </div>
         );
       })}
@@ -856,64 +870,59 @@ function App() {
 
           {/* Right: Menu */}
           <Space size={12}>
-            {adminLoggedIn ? (
+            {isSuperAdmin && (
               <>
-                {isSuperAdmin && (
-                  <Button
-                    type="text"
-                    style={{ color: textColor, height: 36, padding: '0 12px', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 6 }}
-                    onClick={() => setAdminManageVisible(true)}
-                  >
-                    <TeamOutlined />
-                    管理员
-                  </Button>
-                )}
                 <Button
                   type="text"
                   style={{ color: textColor, height: 36, padding: '0 12px', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 6 }}
-                  onClick={() => setLogsVisible(true)}
+                  onClick={() => setOwnerAssignVisible(true)}
                 >
-                  <FileTextOutlined />
-                  系统日志
+                  <TeamOutlined />
+                  指定负责人
                 </Button>
-                <Dropdown
-                  menu={{
-                    items: [
-                      { key: 'changePassword', label: '修改密码', icon: <KeyOutlined /> },
-                      { key: 'logout', label: '退出登录', icon: <LogoutOutlined /> },
-                    ],
-                    onClick: ({ key }) => {
-                      if (key === 'changePassword') setChangePasswordVisible(true);
-                      else if (key === 'logout') handleAdminLogout();
-                    },
-                  }}
-                  trigger={['click']}
+                <Button
+                  type="text"
+                  style={{ color: textColor, height: 36, padding: '0 12px', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 6 }}
+                  onClick={() => setAdminManageVisible(true)}
                 >
-                  <Button
-                    type="text"
-                    style={{ color: textSecondary, height: 36, padding: '0 12px', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 6 }}
-                  >
-                    <UserOutlined />
-                    {adminUsername}
-                    <DownOutlined style={{ fontSize: 10 }} />
-                  </Button>
-                </Dropdown>
+                  <KeyOutlined />
+                  管理员
+                </Button>
               </>
-            ) : (
+            )}
+            {isAdmin && (
               <Button
                 type="text"
                 style={{ color: textColor, height: 36, padding: '0 12px', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 6 }}
-                onClick={() => {
-                  if (hasAdmins) {
-                    setAdminLoginVisible(true);
-                  } else {
-                    setAdminSetupVisible(true);
-                  }
-                }}
+                onClick={() => setLogsVisible(true)}
               >
-                <UserOutlined />
-                {hasAdmins ? '管理员登录' : '设置管理员'}
+                <FileTextOutlined />
+                系统日志
               </Button>
+            )}
+            {me && (
+              <Dropdown
+                menu={{
+                  items: [{ key: 'logout', label: '退出登录', icon: <LogoutOutlined /> }],
+                  onClick: ({ key }) => { if (key === 'logout') handleLogout(); },
+                }}
+                trigger={['click']}
+              >
+                <Button
+                  type="text"
+                  style={{ color: textSecondary, height: 36, padding: '0 12px', borderRadius: 8, display: 'flex', alignItems: 'center', gap: 6 }}
+                >
+                  <UserOutlined />
+                  {me.name}
+                  {me.source === 'emergency' && (
+                    <Badge count="应急" style={{ backgroundColor: '#f5a623', fontSize: 10 }} />
+                  )}
+                  {isSuperAdmin && me.source !== 'emergency' && (
+                    <Badge count="超管" style={{ backgroundColor: '#52c41a', fontSize: 10 }} />
+                  )}
+                  <DownOutlined style={{ fontSize: 10 }} />
+                </Button>
+              </Dropdown>
             )}
 
             <Dropdown menu={{ items: productItems }} trigger={['click']}>
@@ -1131,7 +1140,7 @@ function App() {
                           const files = e.dataTransfer.files;
                           if (files && files.length > 0) {
                             const f = files[0];
-                            if (!file.canDelete) {
+                            if (!file.canManage) {
                               message.error(`${file.title}：暂无编辑权限`);
                             } else {
                               handleUploadNewVersion(file, f);
@@ -1264,7 +1273,7 @@ function App() {
                               onChange={(e) => {
                                 const f = e.target.files?.[0];
                                 if (f) {
-                                  if (!file.canDelete) {
+                                  if (!file.canManage) {
                                     message.error(`${file.title}：暂无编辑权限`);
                                   } else {
                                     handleUploadNewVersion(file, f);
@@ -1273,7 +1282,7 @@ function App() {
                                 e.target.value = '';
                               }}
                             />
-                            {file.canDelete && (
+                            {file.canManage && (
                               <Tooltip title="上传新版本">
                                 <Button
                                   size="small"
@@ -1284,7 +1293,7 @@ function App() {
                                 />
                               </Tooltip>
                             )}
-                            {file.canDelete && (
+                            {file.canManage && (
                               <Tooltip title="编辑信息">
                                 <Button
                                   size="small"
@@ -1296,17 +1305,17 @@ function App() {
                               </Tooltip>
                             )}
                             {file.hasPassword && (
-                              <Tooltip title={file.canDelete ? '已加密，点击修改' : '已加密'}>
+                              <Tooltip title={file.canManage ? '已加密，点击修改' : '已加密'}>
                                 <Button
                                   size="small"
                                   type="text"
                                   icon={<LockOutlined />}
-                                  onClick={(e) => { e.stopPropagation(); file.canDelete && handleSetPassword(file); }}
-                                  style={{ color: '#f5a623', flexShrink: 0, cursor: file.canDelete ? 'pointer' : 'default' }}
+                                  onClick={(e) => { e.stopPropagation(); file.canManage && handleSetPassword(file); }}
+                                  style={{ color: '#f5a623', flexShrink: 0, cursor: file.canManage ? 'pointer' : 'default' }}
                                 />
                               </Tooltip>
                             )}
-                            {file.canDelete && !file.hasPassword && (
+                            {file.canManage && !file.hasPassword && (
                               <Tooltip title="设置密码">
                                 <Button
                                   size="small"
@@ -1377,7 +1386,7 @@ function App() {
                                 style={{ flexShrink: 0 }}
                               />
                             </Tooltip>
-                            {file.canDelete && (
+                            {file.canManage && (
                               <Popconfirm
                                 title="确认删除"
                                 description={`删除「${file.title}」？`}
@@ -1397,11 +1406,17 @@ function App() {
                             )}
                           </div>
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
-                            {file.uploader_ip && (
-                              <div style={{ fontSize: 11, color: textSecondary, fontFamily: 'monospace' }}>
-                                {file.uploader_ip}
-                              </div>
-                            )}
+                            <div style={{
+                              fontSize: 11,
+                              color: file.ownerId ? textSecondary : '#f5a623',
+                              display: 'flex', alignItems: 'center', gap: 4,
+                              minWidth: 0,
+                            }}>
+                              <UserOutlined style={{ fontSize: 10 }} />
+                              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {file.ownerId ? (file.ownerName || file.ownerId) : '未指定负责人'}
+                              </span>
+                            </div>
                             {file.upload_time && (
                               <div style={{ fontSize: 11, color: textSecondary }}>
                                 {formatUploadTime(file.upload_time)}
@@ -1493,116 +1508,85 @@ function App() {
         onClose={() => setChangelogVisible(false)}
       />
 
-      {/* Admin Login Drawer */}
-      <Drawer
-        title="管理员登录"
-        open={adminLoginVisible}
-        onClose={() => setAdminLoginVisible(false)}
-        width={420}
-      >
-        <Form form={adminLoginForm} onFinish={handleAdminLogin} style={{ marginTop: 24 }}>
-          <Form.Item name="username" rules={[{ required: true, message: '请输入用户名' }]}>
-            <Input placeholder="用户名" prefix={<UserOutlined />} />
-          </Form.Item>
-          <Form.Item name="password" rules={[{ required: true, message: '请输入密码' }]}>
-            <Input.Password placeholder="密码" prefix={<LockOutlined />} />
-          </Form.Item>
-          <Form.Item style={{ marginBottom: 0 }}>
-            <Button type="primary" htmlType="submit" block>
-              登录
-            </Button>
-          </Form.Item>
-        </Form>
-      </Drawer>
-
-      {/* Admin Setup Drawer (when no admins exist) */}
-      <Drawer
-        title="设置管理员"
-        open={adminSetupVisible}
-        onClose={() => setAdminSetupVisible(false)}
-        width={420}
-      >
-        <div style={{ marginBottom: 16, color: textSecondary, fontSize: 13 }}>
-          系统尚未设置管理员，请创建第一个管理员账号（将成为超级管理员）。
-        </div>
-        <Form form={adminSetupForm} onFinish={handleAdminSetup} style={{ marginTop: 16 }}>
-          <Form.Item name="username" rules={[{ required: true, message: '请输入用户名' }, { min: 2, message: '用户名至少2字符' }]}>
-            <Input placeholder="用户名（至少2字符）" prefix={<UserOutlined />} />
-          </Form.Item>
-          <Form.Item name="password" rules={[{ required: true, message: '请输入密码' }, { min: 6, message: '密码至少6字符' }]}>
-            <Input.Password placeholder="密码（至少6字符）" prefix={<LockOutlined />} />
-          </Form.Item>
-          <Form.Item style={{ marginBottom: 0 }}>
-            <Button type="primary" htmlType="submit" block>
-              创建并登录
-            </Button>
-          </Form.Item>
-        </Form>
-      </Drawer>
-
-      {/* Admin Manage Drawer — pure CRUD for admin accounts (super admin only) */}
+      {/* 管理员名单（超管）—— 候选来自已登录过本系统的用户 */}
       <Drawer
         title="管理员管理"
         open={adminManageVisible}
         onClose={() => setAdminManageVisible(false)}
         width={480}
       >
-        <div style={{ marginTop: 16 }}>
-          <div style={{ marginBottom: 16 }}>
-            <Text style={{ color: textSecondary, fontSize: 12, display: 'block', marginBottom: 8 }}>添加新管理员</Text>
-            <Space.Compact style={{ width: '100%' }}>
-              <Input placeholder="用户名" id="newAdminUsername" />
-              <Input.Password placeholder="密码" id="newAdminPassword" />
-              <Button type="primary" onClick={async () => {
-                const username = (document.getElementById('newAdminUsername') as HTMLInputElement).value;
-                const password = (document.getElementById('newAdminPassword') as HTMLInputElement).value;
-                if (!username || !password) {
-                  message.warning('请输入用户名和密码');
-                  return;
-                }
-                if (username.length < 2) {
-                  message.warning('用户名至少2字符');
-                  return;
-                }
-                const result = await api.addAdminUser(username, password);
-                if (result.success) {
-                  message.success('添加成功');
-                  (document.getElementById('newAdminUsername') as HTMLInputElement).value = '';
-                  (document.getElementById('newAdminPassword') as HTMLInputElement).value = '';
-                  loadAdminUsers();
-                } else {
-                  message.error(result.message || '添加失败');
-                }
-              }}>添加</Button>
-            </Space.Compact>
+        <div style={{ marginTop: 8 }}>
+          <div style={{ marginBottom: 20 }}>
+            <Text style={{ color: textSecondary, fontSize: 12, display: 'block', marginBottom: 8 }}>
+              添加普通管理员
+            </Text>
+            <Select
+              showSearch
+              placeholder="搜索并选择同事"
+              style={{ width: '100%' }}
+              optionFilterProp="label"
+              value={null}
+              onChange={(value: string) => handleAddAdmin(value)}
+              options={directoryUsers
+                .filter(u => !adminUsers.some(a => a.userId === u.userId))
+                .map(u => ({ label: u.name, value: u.userId }))}
+              notFoundContent="没有可添加的用户"
+            />
+            <Text style={{ color: textSecondary, fontSize: 11, display: 'block', marginTop: 6 }}>
+              只能从登录过本系统的同事里选择。本系统未申请飞书通讯录权限，
+              所以对方需要先用飞书登录一次才会出现在这里。
+            </Text>
           </div>
 
           <div>
-            <Text style={{ color: textSecondary, fontSize: 12, display: 'block', marginBottom: 8 }}>管理员列表</Text>
-            {adminUsers.map(user => (
-              <div key={user.username} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0', borderBottom: `1px solid ${borderColor}` }}>
-                <div>
-                  <UserOutlined style={{ marginRight: 8 }} />
-                  {user.username}
-                  {user.username === adminUsername && <Badge status="success" text="当前" style={{ marginLeft: 8 }} />}
+            <Text style={{ color: textSecondary, fontSize: 12, display: 'block', marginBottom: 8 }}>
+              管理员列表
+            </Text>
+            {adminUsers.map(user => {
+              const isSelf = user.userId === me?.userId;
+              const isSuper = user.level === 'super';
+              return (
+                <div key={user.userId} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0', borderBottom: `1px solid ${borderColor}` }}>
+                  <div style={{ minWidth: 0 }}>
+                    <UserOutlined style={{ marginRight: 8 }} />
+                    <span style={{ color: textColor }}>{user.name}</span>
+                    {isSuper && <Badge count="超管" style={{ backgroundColor: '#52c41a', fontSize: 10, marginLeft: 8 }} />}
+                    {isSelf && <Badge status="success" text="当前" style={{ marginLeft: 8 }} />}
+                    <div style={{ fontSize: 11, color: textSecondary, fontFamily: 'monospace', marginTop: 2 }}>
+                      {user.userId}
+                    </div>
+                  </div>
+                  {!isSelf && (
+                    <Popconfirm
+                      title="移除管理员"
+                      description={`将 ${user.name} 从管理员名单中移除？`}
+                      okText="移除"
+                      cancelText="取消"
+                      okButtonProps={{ danger: true }}
+                      onConfirm={() => handleDeleteAdmin(user.userId)}
+                    >
+                      <Button size="small" danger>移除</Button>
+                    </Popconfirm>
+                  )}
                 </div>
-                {user.username !== adminUsername && (
-                  <Button size="small" danger onClick={() => handleDeleteAdmin(user.username)}>
-                    删除
-                  </Button>
-                )}
-              </div>
-            ))}
-            {adminUsers.length === 0 && <Text style={{ color: textSecondary }}>暂无其他管理员</Text>}
+              );
+            })}
+            {adminUsers.length === 0 && <Text style={{ color: textSecondary }}>暂无管理员</Text>}
           </div>
         </div>
       </Drawer>
 
+      {/* 批量指定项目负责人（超管）*/}
+      <OwnerAssignDrawer
+        visible={ownerAssignVisible}
+        files={files}
+        users={directoryUsers}
+        onClose={() => setOwnerAssignVisible(false)}
+        onSubmit={handleAssignOwner}
+      />
+
       {/* System Logs Drawer — any logged-in admin (super or regular) has equal access */}
       <LogsDrawer visible={logsVisible} onClose={() => setLogsVisible(false)} />
-
-      {/* Change Own Password Drawer */}
-      <ChangePasswordDrawer visible={changePasswordVisible} onClose={() => setChangePasswordVisible(false)} />
 
       {/* Version History Drawer */}
       <Drawer
@@ -1650,19 +1634,19 @@ function App() {
                       {version}
                     </span>
                     <span style={{ flex: 1, fontSize: 12, color: textSecondary }}>
-                      {dateStr} {info.uploader_ip && `· ${info.uploader_ip}`}
+                      {dateStr} {info.owner_name ? `· ${info.owner_name}` : (info.uploader_ip ? `· ${info.uploader_ip}` : '')}
                     </span>
                     <Button size="small" onClick={() => window.open(`/versions/${versionFile?.path}/${version}`, '_blank')}>
                       预览
                     </Button>
                     {/* 恢复入口仅对有编辑权限的用户显示（上传者本人或已登录管理员）；
                         版本列表与预览本身无需权限，任何人可见 */}
-                    {versionFile?.canDelete && (
+                    {versionFile?.canManage && (
                       <Button size="small" onClick={() => handleRestoreVersion(version)}>
                         恢复此版本
                       </Button>
                     )}
-                    {versionFile?.canDelete && (
+                    {versionFile?.canManage && (
                       <Popconfirm
                         title="确认删除"
                         description={`删除 ${version} 版本？`}

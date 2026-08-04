@@ -45,6 +45,7 @@ export default function LogsDrawer({ visible, onClose }: LogsDrawerProps) {
 
   const [q, setQ] = useState('');
   const [actor, setActor] = useState('');
+  const [actorId, setActorId] = useState('');
   const [ip, setIp] = useState('');
   const [actionType, setActionType] = useState('');
 
@@ -52,7 +53,7 @@ export default function LogsDrawer({ visible, onClose }: LogsDrawerProps) {
     setLoading(true);
     try {
       const result = await api.getLogs({
-        q, actor, ip, actionType,
+        q, actor, actorId, ip, actionType,
         page: targetPage,
         pageSize: PAGE_SIZE,
       });
@@ -64,7 +65,7 @@ export default function LogsDrawer({ visible, onClose }: LogsDrawerProps) {
     } finally {
       setLoading(false);
     }
-  }, [q, actor, ip, actionType]);
+  }, [q, actor, actorId, ip, actionType]);
 
   // Reload from page 1 whenever filters change (while the drawer is open)
   useEffect(() => {
@@ -72,7 +73,7 @@ export default function LogsDrawer({ visible, onClose }: LogsDrawerProps) {
       loadLogs(1);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, q, actor, ip, actionType]);
+  }, [visible, q, actor, actorId, ip, actionType]);
 
   const columns = [
     { title: '时间', dataIndex: 'time', key: 'time', width: 150, render: (t: string) => t?.replace('T', ' ') },
@@ -83,7 +84,17 @@ export default function LogsDrawer({ visible, onClose }: LogsDrawerProps) {
         return <Tag color={info.color}>{info.text}</Tag>;
       },
     },
-    { title: '操作者', dataIndex: 'actor', key: 'actor', width: 120 },
+    {
+      title: '操作者', dataIndex: 'actor_name', key: 'actor_name', width: 130,
+      render: (name: string, row: LogEntry) => (
+        <span title={row.actor_id ? `身份标识：${row.actor_id}` : '改造前的历史记录，无稳定身份标识'}>
+          {name || row.actor || '-'}
+          {row.actor_id?.startsWith('emergency:') && (
+            <Tag color="orange" style={{ marginLeft: 4 }}>应急</Tag>
+          )}
+        </span>
+      ),
+    },
     { title: '来源IP', dataIndex: 'ip', key: 'ip', width: 130 },
     {
       title: '操作', dataIndex: 'action', key: 'action', width: 110,
@@ -111,11 +122,18 @@ export default function LogsDrawer({ visible, onClose }: LogsDrawerProps) {
           style={{ width: 200 }}
         />
         <Input
-          placeholder="按操作者筛选"
+          placeholder="按操作者姓名筛选"
           value={actor}
           onChange={(e) => setActor(e.target.value)}
           allowClear
           style={{ width: 160 }}
+        />
+        <Input
+          placeholder="按身份标识精确筛选"
+          value={actorId}
+          onChange={(e) => setActorId(e.target.value)}
+          allowClear
+          style={{ width: 180 }}
         />
         <Input
           placeholder="按IP筛选"
@@ -133,7 +151,7 @@ export default function LogsDrawer({ visible, onClose }: LogsDrawerProps) {
       </div>
 
       <Table
-        rowKey={(r) => `${r.time}-${r.actor}-${r.action}-${r.target}`}
+        rowKey={(r) => `${r.time}-${r.actor_id || r.actor}-${r.action}-${r.target}`}
         columns={columns}
         dataSource={logs}
         loading={loading}

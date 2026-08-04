@@ -103,15 +103,15 @@ graph TD
   - 明确 `_system_admins_` 不参与飞书登录路径的管理员判定
   - _Requirements: 1.6, 1.7, 1.8, 5.9, 5.10, 8.1, 8.2, 8.3, 8.5, 8.14_
 
-- [ ] 6. 实现认证 Blueprint 与身份中间件（形态 A 可端到端验证）
-- [ ] 6.1 认证路由
+- [x] 6. 实现认证 Blueprint 与身份中间件（形态 A 可端到端验证）
+- [x] 6.1 认证路由
   - 新建 `server/auth/__init__.py`，注册 `GET /auth/login`、`GET /auth/feishu/callback`、`POST /auth/logout`、`GET /auth/health`
   - `/auth/login`：已有有效会话则按回跳规则 302；否则生成 128 位熵 `state`（含 `return_to`、`redirect_uri`、10 分钟过期）后 302 到飞书授权页
   - `/auth/feishu/callback`：`state` 四类失败（缺失/无记录/过期/已用）统一 400 + 审计；先标记 `state` 已用再换令牌；取用户信息后写档案、签发会话、按回跳规则 302
   - 回跳白名单：仅接受以单个 `/` 开头的站内相对路径，或主机名等于管理域/预览域；否则回管理域首页
   - 会话 Cookie：`HttpOnly`、`SameSite=Lax`、`Path=/`、`Domain` 为完整主机名不设父域；`DEPLOY_ENV=production` 时追加 `Secure`
   - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.9, 1.10, 1.13, 1.14, 1.15, 3.10, 3.11, 3.12, 3.13_
-- [ ] 6.2 身份解析中间件
+- [x] 6.2 身份解析中间件
   - 新建 `server/auth/identity.py`，`before_request` 钩子把身份写入 `flask.g.actor`
   - `embedded` 模式：无条件剥离并忽略所有 `X-Auth-*` / `X_Auth_*` 头（不区分大小写），身份只从会话 Cookie 解析
   - `gateway` 模式：先校验 `request.remote_addr` 属于 `TRUSTED_GATEWAY_IPS`，不属于则 403 且不采信任何 `X-Auth-*`；通过后只读 `X-Auth-User-Id`
@@ -120,23 +120,23 @@ graph TD
   - 未认证时按 `Accept` 分流：含 `text/html` 则 302 到登录入口并带回跳参数（超 2048 字节则不带），否则 401 且响应体不含受保护内容
   - 移除 `X-Admin-Token` 的一切认证能力
   - _Requirements: 2.4, 2.5, 2.6, 2.7, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14, 2.15, 7.7_
-- [ ] 6.3 集成到 create_app 并接首个超管授予
+- [x] 6.3 集成到 create_app 并接首个超管授予
   - 在 `create_app()` 中注册 Blueprint 与 `before_request`，`/auth/*` 与健康检查排除在认证要求之外
   - 名单为空时调用飞书校验应用管理员并授予超管；接口超时/失败/返回假则完成登录、按普通员工处理并写审计
   - 名单非空时不再调用该飞书接口
   - _Requirements: 2.2, 8.2, 8.3, 8.4, 8.5_
 
-- [ ] 7. 改造权限模型
-- [ ] 7.1 实现 can_manage
+- [x] 7. 改造权限模型
+- [x] 7.1 实现 can_manage
   - 新建 `server/permissions.py`，定义 `Actor` 数据类与 `can_manage(project_meta, actor)`
   - 判定式：管理员（超管与普通管理员一视同仁）恒真；否则 `owner_id` 非空且等于 `actor.user_id` 才为真；无负责人项目对非管理员恒假
   - `uploader_ip` 不作为任何输入
   - _Requirements: 5.6, 5.8, 7.1, 7.2, 7.3_
-- [ ] 7.2 改造 file_manager 接口
+- [x] 7.2 改造 file_manager 接口
   - `delete_file`、`restore_version_file`、`delete_version_file` 的 `request_ip` / `is_admin` 参数改为由调用方传入的 `allowed: bool` 与 `actor`
   - 删除 `can_delete()`，清理其全部调用点
   - _Requirements: 5.6, 7.4_
-- [ ] 7.3 路由接入权限校验
+- [x] 7.3 路由接入权限校验
   - 编辑项目信息、设置项目访问密码、上传新版本、恢复历史版本、删除历史版本、删除项目六类操作，每次请求依据 `g.actor` 与目标项目重新计算 `canManage`，不采纳请求体中任何权限字段
   - 为假时返回 403，且元数据条目、当前版本文件、历史版本归档均保持原状
   - 上传新项目（目标标识尚不存在）跳过 `canManage` 校验，但要求已认证
@@ -144,21 +144,21 @@ graph TD
   - 项目列表 / 版本历史 / 预览历史版本对任意已认证用户开放，未认证返回 401 且不返回任何项目数据
   - _Requirements: 7.4, 7.5, 7.6, 7.7, 7.10, 7.11_
 
-- [ ] 8. 实现所有权写入与存量迁移
-- [ ] 8.1 上传路径写入负责人
+- [x] 8. 实现所有权写入与存量迁移
+- [x] 8.1 上传路径写入负责人
   - 新建项目时写 `owner_id` / `owner_name`（取自会话）；新增版本时在版本记录写 UserID 与姓名快照，且不改动项目级 `owner_id`
   - 会话缺 UserID 或姓名时拒绝上传，不落任何文件与元数据，提示重新登录
   - 继续写入 `uploader_ip`，用途收窄为审计展示
   - 读取时 `owner_id` 缺失或为空一律视为无负责人；展示名优先取用户档案，查不到则用 `owner_name` 快照
   - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 5.7, 5.9, 5.10, 5.11_
-- [ ] 8.2 迁移脚本
+- [x] 8.2 迁移脚本
   - 新建 `server/migrate_identity.py`：显式留一份带时间戳的 `metadata.json` 副本，在单个 `transaction()` 内补齐字段
   - 幂等：已有非空 `owner_id` / `owner_name` 不覆盖；重复执行结果逐字段一致
   - 保全所有既有字段，含 41 个存量项目的项目级 `uploader_ip` 与 67 个归档的版本级 `uploader_ip`
   - 建立 `_system_users_` 与 `_system_admin_list_` 空容器
   - 失败时不提交，文件保持原内容；结束时输出项目总数与待指定负责人数量
   - _Requirements: 5.12, 5.13, 5.14, 5.15, 5.16_
-- [ ] 8.3 批量指定负责人接口
+- [x] 8.3 批量指定负责人接口
   - 新增 `POST /api/projects/owner`，接受项目标识数组与目标 UserID
   - 校验顺序固定为 权限(403) → 参数(400) → 项目存在性(404)；重复标识去重；单次上限 100 个，为 0 或超限返回 400
   - 目标 UserID 必须存在于用户档案，否则 400 并说明该员工需先登录一次
@@ -167,7 +167,7 @@ graph TD
   - 新增 `GET /api/users` 返回用户档案列表供选人
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7, 6.8, 6.9, 6.10, 6.11_
 
-- [ ] 9. 改造管理员管理接口
+- [x] 9. 改造管理员管理接口
   - `GET /api/admins` 返回以 UserID 为主键的名单（含姓名、级别、创建时间）
   - `POST /api/admins` 从用户档案添加普通管理员；目标不在档案则 400 并说明需先登录
   - `DELETE /api/admins/<user_id>`：不在名单返回 404；移除自己返回 400；会使超管数量降为 0 返回 400
@@ -177,7 +177,7 @@ graph TD
   - 移除 `/api/admin/login`、`/api/admin/logout`、`/api/admin/setup`、`/api/admin/status`、`/api/admin/password` 五个路由
   - _Requirements: 8.6, 8.7, 8.8, 8.9, 8.10, 8.11, 8.12, 8.13_
 
-- [ ] 10. 扩展审计日志
+- [x] 10. 扩展审计日志
   - `audit.log()` 新增 `actor_id` 与 `actor_name` 字段（各截断到 64 字符），飞书用户写 UserID，应急通道写 `emergency:` 前缀标识
   - 项目级访问事件写访问者 UserID 与姓名；无法确定身份时 `actor_id` 写 `anonymous`、`actor_name` 写空字符串，`ip` 仍写来源 IP
   - 保留原 `actor` 字段（取 `actor_name`，为空时取 IP），使既有查询与展示不受影响
@@ -188,14 +188,14 @@ graph TD
   - 日志写入失败不中断业务请求
   - _Requirements: 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8, 10.9, 10.10, 10.11_
 
-- [ ] 11. 前端改造
-- [ ] 11.1 凭据与请求层
+- [x] 11. 前端改造
+- [x] 11.1 凭据与请求层
   - `api.ts` 移除 `authHeaders()` 与 `X-Admin-Token`，所有请求（含 `postFileWithProgress` 的 XHR）改为携带 Cookie、设置 `credentials: 'same-origin'` 与 `xhr.withCredentials`
   - 401 统一处理：清除本地登录态并在 1 秒内跳转登录入口，同一页面生命周期内多个 401 只跳一次
   - 应用加载时清除 localStorage 中遗留的管理员 Token 键
   - 新增 `getMe()` 调用 `/api/me`
   - _Requirements: 11.1, 11.2, 11.3, 11.7, 11.11_
-- [ ] 11.2 登录态与按人筛选
+- [x] 11.2 登录态与按人筛选
   - 导航栏展示当前登录用户姓名与登出入口；登出请求后端结束会话再跳登录入口
   - 侧边栏「上传者」改为「负责人」，按 `owner_id` 分组，标签用姓名并展示数量，姓名超 20 字符省略号截断
   - `owner_id` 为空归入「未指定负责人」分组并排在最后
@@ -204,13 +204,13 @@ graph TD
   - 所有操作入口由 `canManage` 驱动（替换 `canDelete`）
   - 移除管理员登录抽屉、首个管理员创建抽屉、修改密码抽屉
   - _Requirements: 11.4, 11.5, 11.6, 11.8, 11.9, 11.10, 7.8_
-- [ ] 11.3 指定负责人界面
+- [x] 11.3 指定负责人界面
   - 「未指定负责人」筛选下提供多选与批量指定负责人的入口（仅超管可见）
   - 负责人候选列表来自 `GET /api/users`
   - 管理员管理抽屉改为按 UserID 从用户档案添加/移除，非超管隐藏入口
   - _Requirements: 6.12, 8.9_
 
-- [ ] 12. 实现应急管理员通道
+- [x] 12. 实现应急管理员通道
   - 新建 `server/auth/emergency.py`，在后台线程起独立 werkzeug 服务实例绑定 `EMERGENCY_BIND`（默认 `127.0.0.1:8099`）
   - 启动前校验绑定地址为回环（`127.0.0.1` / `::1` / `localhost`），否则拒绝启动整个进程并输出违规说明
   - 请求进入后二次校验 `remote_addr` 为回环，否则不校验凭据直接 403 + 审计
@@ -240,7 +240,7 @@ graph TD
   - 应急通道端口排除在代理之外
   - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 4.1, 4.2, 4.3, 4.4, 4.5, 4.13, 9.3_
 
-- [ ] 14. 改造项目访问密码与访问凭证
+- [x] 14. 改造项目访问密码与访问凭证
   - 密码校验入口仅在管理域提供，密码明文出现范围限定为该次请求体与进程内存，单次接受长度上限 128 字符
   - 校验通过签发 8 小时有效的无状态访问凭证，payload 含 UserID、项目标识、密码版本 `pv`（取当前 bcrypt 哈希前 12 字符）
   - 预览域校验四项条件：签名有效、未过期、凭证内 UserID 与当前预览域会话一致、项目标识一致
@@ -250,7 +250,7 @@ graph TD
   - 移除 `_access_tokens` 进程内字典与一年期 Cookie 逻辑
   - _Requirements: 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 14.7, 14.8, 14.9_
 
-- [ ] 15. 统一错误页与降级行为
+- [x] 15. 统一错误页与降级行为
   - 实现统一错误页模板，不回显飞书原始响应内容，不暴露应急管理员通道路径，仅呈现失败原因分类
   - 飞书超时（5 秒）→ 含「重新发起授权」入口；授权码无效或已使用 → 含「重新登录」入口并保持原有会话 Cookie 与记录不变
   - 校验端点对会话的校验不发起任何飞书请求，保证飞书不可用时既有会话继续可用

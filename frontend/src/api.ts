@@ -1,48 +1,87 @@
 /**
  * API 封装模块
  *
- * 功能说明：
- * - 封装所有与后端的 HTTP 通信
- * - 自动携带管理员 Token（X-Admin-Token header）
- * - localStorage 管理 Token 持久化
+ * 认证方式（飞书 SSO 改造后）：
+ * - 身份凭据只走浏览器 Cookie（HttpOnly），前端拿不到也不保存任何 token
+ * - 所有请求带 credentials: 'same-origin'
+ * - 不再发送 X-Admin-Token —— 之所以彻底移除，是因为把凭据放在 localStorage
+ *   意味着任何上传到本平台的 HTML 原型都能用 JS 读走它并冒充管理员操作
+ * - 收到 401 时统一跳转登录入口，同一页面生命周期内只跳一次
  *
  * API 分类：
- * - 文件操作：getFiles, uploadFile, updateFile, deleteFile, checkPassword
- * - 管理员操作：getAdminStatus, adminLogin, adminLogout, getAdminUsers, addAdminUser, deleteAdminUser, changeAdminPassword, adminSetup
- * - 系统状态：getStatus
+ * - 身份：getMe, logout, getDirectoryUsers
+ * - 项目：getFiles, uploadFile, updateFile, deleteFile, assignOwner
+ * - 版本：getVersions, uploadNewVersion, restoreVersion, deleteVersion
+ * - 密码：checkFileSession, checkPassword
+ * - 管理员：getAdmins, addAdmin, removeAdmin
+ * - 系统：getStatus, getChangelog, getLogs
  */
 
-import type { FileInfo, ApiResponse, VersionsResponse, ChangelogEntry, LogEntry } from './types';
+import type {
+  FileInfo, ApiResponse, VersionsResponse, ChangelogEntry, LogEntry,
+  CurrentUser, DirectoryUser, AdminEntry,
+} from './types';
 
-// API 基础路径
 const API_BASE = '/api';
+const LOGIN_PATH = '/auth/login';
 
-export const getAdminToken = (): string | null => localStorage.getItem('adminToken');
-export const setAdminToken = (token: string) => localStorage.setItem('adminToken', token);
-export const clearAdminToken = () => localStorage.removeItem('adminToken');
+/** 遗留的管理员 Token 键 —— 应用加载时清理掉，避免旧凭据残留在浏览器里 */
+const LEGACY_TOKEN_KEYS = ['adminToken'];
+
+export function clearLegacyCredentials(): void {
+  try {
+    LEGACY_TOKEN_KEYS.forEach(k => localStorage.removeItem(k));
+  } catch {
+    // localStorage 不可用（隐私模式等）时忽略即可
+  }
+}
 
 /**
- * Admin session header for mutating requests.
- *
- * Every write endpoint must carry this: the backend decides "管理员对所有项目
- * 有全部操作权限" from the X-Admin-Token header. `/api/files` sends it, so
- * `canDelete` comes back true for admins and the UI enables every button —
- * if the follow-up write request omits the token the backend can't see the
- * admin session and rejects it with 403, and the audit log attributes the
- * action to a bare IP instead of the admin's name.
+ * 401 只跳转一次。
+ * 首屏往往并发发出多个请求，若每个 401 都触发跳转，会连续 replace 多次，
+ * 把浏览器历史搞乱，也可能打断正在进行的跳转。
  */
-const authHeaders = (): Record<string, string> => {
-  const token = getAdminToken();
-  return token ? { 'X-Admin-Token': token } : {};
-};
+let redirecting = false;
 
-/** Upload progress callback: percent is 0-100 of bytes sent. */
+export function redirectToLogin(): void {
+  if (redirecting) return;
+  redirecting = true;
+  clearLegacyCredentials();
+  const returnTo = encodeURIComponent(window.location.pathname + window.location.search);
+  window.location.href = `${LOGIN_PATH}?return_to=${returnTo}`;
+}
+
+/** 统一请求入口：带 Cookie、401 自动跳登录、异常收敛成 ApiResponse */
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(path, { credentials: 'same-origin', ...init });
+  } catch {
+    return { success: false, message: '网络请求失败' } as unknown as T;
+  }
+  if (res.status === 401) {
+    redirectToLogin();
+    return { success: false, message: '未登录', needLogin: true } as unknown as T;
+  }
+  try {
+    return await res.json() as T;
+  } catch {
+    return { success: false, message: `请求失败（HTTP ${res.status}）` } as unknown as T;
+  }
+}
+
+const jsonInit = (method: string, body?: unknown): RequestInit => ({
+  method,
+  headers: { 'Content-Type': 'application/json' },
+  ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+});
+
+/** 上传进度回调：percent 为已发送字节的百分比 */
 export type UploadProgressHandler = (percent: number) => void;
 
 /**
- * POST a file via XMLHttpRequest so upload progress can be reported.
- * `fetch` gives no upload progress events, which left large ZIP uploads with
- * no feedback at all — hence the XHR here.
+ * 用 XMLHttpRequest 上传以便上报进度（fetch 没有上传进度事件）。
+ * withCredentials 让 Cookie 随之发送，与 fetch 的 same-origin 行为一致。
  */
 function postFileWithProgress<T>(
   url: string,
@@ -55,7 +94,7 @@ function postFileWithProgress<T>(
 
     const xhr = new XMLHttpRequest();
     xhr.open('POST', url);
-    Object.entries(authHeaders()).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+    xhr.withCredentials = true;
 
     if (onProgress) {
       xhr.upload.onprogress = (e) => {
@@ -63,11 +102,16 @@ function postFileWithProgress<T>(
           onProgress(Math.round((e.loaded / e.total) * 100));
         }
       };
-      // Bytes are all sent — the server is now unzipping/writing to disk.
+      // 字节已全部发出，服务端开始解压/写盘
       xhr.upload.onload = () => onProgress(100);
     }
 
     xhr.onload = () => {
+      if (xhr.status === 401) {
+        redirectToLogin();
+        resolve({ success: false, message: '未登录' } as unknown as T);
+        return;
+      }
       try {
         resolve(JSON.parse(xhr.responseText) as T);
       } catch {
@@ -85,177 +129,106 @@ function postFileWithProgress<T>(
 }
 
 export const api = {
-  async getFiles(): Promise<ApiResponse<FileInfo[]>> {
-    const token = getAdminToken();
-    const res = await fetch(`${API_BASE}/files`, {
-      headers: token ? { 'X-Admin-Token': token } : {},
-    });
-    return res.json();
+  // ── 身份 ──────────────────────────────────────────────────────────────────
+  getMe(): Promise<ApiResponse<CurrentUser>> {
+    return request(`${API_BASE}/me`);
+  },
+
+  logout(): Promise<ApiResponse> {
+    return request('/auth/logout', jsonInit('POST'));
+  },
+
+  getDirectoryUsers(): Promise<ApiResponse<DirectoryUser[]>> {
+    return request(`${API_BASE}/users`);
+  },
+
+  // ── 项目 ──────────────────────────────────────────────────────────────────
+  getFiles(): Promise<ApiResponse<FileInfo[]>> {
+    return request(`${API_BASE}/files`);
   },
 
   uploadFile(file: File, onProgress?: UploadProgressHandler): Promise<ApiResponse<{ key?: string; keys?: string[] }>> {
     return postFileWithProgress(`${API_BASE}/files/upload`, file, onProgress);
   },
 
-  async updateFile(key: string, data: { title?: string; description?: string; productLine?: string; password?: string }): Promise<ApiResponse> {
-    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', ...authHeaders() },
-      body: JSON.stringify(data),
-    });
-    return res.json();
+  updateFile(key: string, data: { title?: string; description?: string; productLine?: string; password?: string }): Promise<ApiResponse> {
+    return request(`${API_BASE}/files/${encodeURIComponent(key)}`, jsonInit('PUT', data));
   },
 
-  async deleteFile(key: string): Promise<ApiResponse> {
-    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}`, {
-      method: 'DELETE',
-      headers: authHeaders(),
-    });
-    return res.json();
+  deleteFile(key: string): Promise<ApiResponse> {
+    return request(`${API_BASE}/files/${encodeURIComponent(key)}`, { method: 'DELETE' });
   },
 
-  async checkFileSession(key: string): Promise<ApiResponse & { hasAccess?: boolean; hasPassword?: boolean }> {
-    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}/session`);
-    return res.json();
+  /** 批量指定负责人（超管）。全有或全无：任一项目不存在则整批不改动 */
+  assignOwner(keys: string[], ownerId: string): Promise<ApiResponse & { ownerName?: string }> {
+    return request(`${API_BASE}/projects/owner`, jsonInit('POST', { keys, ownerId }));
   },
 
-  async checkPassword(key: string, password: string): Promise<ApiResponse<{ token?: string }>> {
-    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}/password`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password }),
-    });
-    return res.json();
+  // ── 密码 ──────────────────────────────────────────────────────────────────
+  checkFileSession(key: string): Promise<ApiResponse & { hasAccess?: boolean; hasPassword?: boolean }> {
+    return request(`${API_BASE}/files/${encodeURIComponent(key)}/session`);
   },
 
-  // Version management APIs
-  async getVersions(key: string): Promise<ApiResponse & { data?: VersionsResponse }> {
-    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}/versions`);
-    return res.json();
+  checkPassword(key: string, password: string): Promise<ApiResponse> {
+    return request(`${API_BASE}/files/${encodeURIComponent(key)}/password`,
+      jsonInit('POST', { password }));
+  },
+
+  // ── 版本 ──────────────────────────────────────────────────────────────────
+  getVersions(key: string): Promise<ApiResponse & { data?: VersionsResponse }> {
+    return request(`${API_BASE}/files/${encodeURIComponent(key)}/versions`);
   },
 
   uploadNewVersion(key: string, file: File, onProgress?: UploadProgressHandler): Promise<ApiResponse & { version?: string }> {
     return postFileWithProgress(`${API_BASE}/files/${encodeURIComponent(key)}/versions`, file, onProgress);
   },
 
-  async restoreVersion(key: string, version: string): Promise<ApiResponse> {
-    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}/versions/${version}/restore`, {
-      method: 'PUT',
-      headers: authHeaders(),
-    });
-    return res.json();
+  restoreVersion(key: string, version: string): Promise<ApiResponse> {
+    return request(`${API_BASE}/files/${encodeURIComponent(key)}/versions/${version}/restore`,
+      { method: 'PUT' });
   },
 
-  async deleteVersion(key: string, version: string): Promise<ApiResponse> {
-    const res = await fetch(`${API_BASE}/files/${encodeURIComponent(key)}/versions/${version}`, {
-      method: 'DELETE',
-      headers: authHeaders(),
-    });
-    return res.json();
+  deleteVersion(key: string, version: string): Promise<ApiResponse> {
+    return request(`${API_BASE}/files/${encodeURIComponent(key)}/versions/${version}`,
+      { method: 'DELETE' });
   },
 
-  async getStatus(): Promise<ApiResponse & { version?: string }> {
-    const res = await fetch(`${API_BASE}/status`);
-    return res.json();
+  // ── 管理员名单 ────────────────────────────────────────────────────────────
+  getAdmins(): Promise<ApiResponse<AdminEntry[]>> {
+    return request(`${API_BASE}/admins`);
   },
 
-  async getChangelog(): Promise<ApiResponse & { data?: ChangelogEntry[]; current_version?: string }> {
-    const res = await fetch(`${API_BASE}/changelog`);
-    return res.json();
+  addAdmin(userId: string): Promise<ApiResponse> {
+    return request(`${API_BASE}/admins`, jsonInit('POST', { userId }));
   },
 
-  // Admin APIs
-  async getAdminStatus(): Promise<ApiResponse & { isLoggedIn?: boolean; username?: string; isSuperAdmin?: boolean; hasAdmins?: boolean }> {
-    const token = getAdminToken();
-    const res = await fetch(`${API_BASE}/admin/status`, {
-      headers: token ? { 'X-Admin-Token': token } : {},
-    });
-    return res.json();
+  removeAdmin(userId: string): Promise<ApiResponse> {
+    return request(`${API_BASE}/admins/${encodeURIComponent(userId)}`,
+      { method: 'DELETE' });
   },
 
-  async adminSetup(username: string, password: string): Promise<ApiResponse> {
-    const res = await fetch(`${API_BASE}/admin/setup`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
-    });
-    return res.json();
+  // ── 系统 ──────────────────────────────────────────────────────────────────
+  getStatus(): Promise<ApiResponse & { version?: string; authMode?: string }> {
+    return request(`${API_BASE}/status`);
   },
 
-  async adminLogin(username: string, password: string): Promise<ApiResponse & { token?: string; username?: string; isSuperAdmin?: boolean }> {
-    const res = await fetch(`${API_BASE}/admin/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
-    });
-    return res.json();
+  getChangelog(): Promise<ApiResponse & { data?: ChangelogEntry[]; current_version?: string }> {
+    return request(`${API_BASE}/changelog`);
   },
 
-  async adminLogout(): Promise<ApiResponse> {
-    const token = getAdminToken();
-    const res = await fetch(`${API_BASE}/admin/logout`, {
-      method: 'POST',
-      headers: token ? { 'X-Admin-Token': token } : {},
-    });
-    return res.json();
-  },
-
-  async getAdminUsers(): Promise<ApiResponse & { data?: { username: string; created_at: string }[] }> {
-    const token = getAdminToken();
-    const res = await fetch(`${API_BASE}/admin/users`, {
-      headers: token ? { 'X-Admin-Token': token } : {},
-    });
-    return res.json();
-  },
-
-  async addAdminUser(username: string, password: string): Promise<ApiResponse> {
-    const token = getAdminToken();
-    const res = await fetch(`${API_BASE}/admin/users`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Admin-Token': token || '',
-      },
-      body: JSON.stringify({ username, password }),
-    });
-    return res.json();
-  },
-
-  async deleteAdminUser(username: string): Promise<ApiResponse> {
-    const token = getAdminToken();
-    const res = await fetch(`${API_BASE}/admin/users/${encodeURIComponent(username)}`, {
-      method: 'DELETE',
-      headers: token ? { 'X-Admin-Token': token } : {},
-    });
-    return res.json();
-  },
-
-  async changeAdminPassword(oldPassword: string, newPassword: string): Promise<ApiResponse> {
-    const token = getAdminToken();
-    const res = await fetch(`${API_BASE}/admin/password`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Admin-Token': token || '',
-      },
-      body: JSON.stringify({ oldPassword, newPassword }),
-    });
-    return res.json();
-  },
-
-  async getLogs(params: { q?: string; actor?: string; ip?: string; category?: string; actionType?: string; page?: number; pageSize?: number }): Promise<ApiResponse & { logs?: LogEntry[]; total?: number; page?: number; pageSize?: number }> {
-    const token = getAdminToken();
+  getLogs(params: {
+    q?: string; actor?: string; actorId?: string; ip?: string;
+    category?: string; actionType?: string; page?: number; pageSize?: number;
+  }): Promise<ApiResponse & { logs?: LogEntry[]; total?: number; page?: number; pageSize?: number }> {
     const qs = new URLSearchParams();
     if (params.q) qs.set('q', params.q);
     if (params.actor) qs.set('actor', params.actor);
+    if (params.actorId) qs.set('actor_id', params.actorId);
     if (params.ip) qs.set('ip', params.ip);
     if (params.category) qs.set('category', params.category);
     if (params.actionType) qs.set('action_type', params.actionType);
     qs.set('page', String(params.page || 1));
     qs.set('pageSize', String(params.pageSize || 100));
-    const res = await fetch(`${API_BASE}/logs?${qs.toString()}`, {
-      headers: token ? { 'X-Admin-Token': token } : {},
-    });
-    return res.json();
+    return request(`${API_BASE}/logs?${qs.toString()}`);
   },
 };

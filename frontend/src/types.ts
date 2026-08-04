@@ -17,12 +17,14 @@ export interface FileInfo {
   path: string;          // 文件相对路径
   title: string;         // 显示标题
   description: string;   // 文件描述
-  uploader_ip: string | null;  // 上传者 IP
+  ownerId: string;       // 负责人飞书 UserID，空字符串表示未指定负责人
+  ownerName: string;     // 负责人姓名（优先取用户档案最新值，否则用快照）
+  uploader_ip: string | null;  // 上传来源 IP —— 仅供审计展示，不参与权限判定
   upload_time: string | null;  // 上传时间（ISO 格式，当前版本的上传时间）
   init_upload_time: string | null;  // 初始上传时间（首次创建的时间）
   isDir: boolean;        // 是否为目录（预留）
-  url: string;           // 访问 URL
-  canDelete: boolean;    // 当前用户是否有权删除
+  url: string;           // 访问 URL（gateway 形态下为预览域绝对地址）
+  canManage: boolean;    // 当前用户是否可管理此项目（负责人本人或管理员）
   productLine?: string;  // 产品线分类
   hasPassword?: boolean; // 是否有密码保护
   currentVersion?: string; // 当前版本号，如 "V3"
@@ -32,6 +34,8 @@ export interface FileInfo {
 export interface VersionInfo {
   upload_time: string;
   uploader_ip: string;
+  owner_id?: string;    // 该版本的上传者飞书 UserID
+  owner_name?: string;  // 该版本上传者姓名快照
 }
 
 // 版本列表响应
@@ -51,12 +55,39 @@ export interface ChangelogEntry {
 // 审计日志条目
 export interface LogEntry {
   time: string;
-  category: string;   // "project" | "admin" | "access"
+  category: string;     // "project" | "admin" | "access"
   action: string;
-  actor: string;
+  actor_id: string;     // 稳定身份主键：飞书 UserID / emergency:账号 / anonymous
+  actor_name: string;   // 展示名
+  actor: string;        // 兼容字段，取 actor_name，为空时取 IP
   ip: string;
   target: string;
   detail: string;
+}
+
+// 当前登录者
+export interface CurrentUser {
+  userId: string;
+  name: string;
+  isAdmin: boolean;
+  isSuperAdmin: boolean;
+  source: string;       // "feishu" | "emergency"
+}
+
+// 用户档案条目（「指定负责人」「添加管理员」的候选来源）
+export interface DirectoryUser {
+  userId: string;
+  name: string;
+  firstLoginAt: string;
+  lastLoginAt: string;
+}
+
+// 管理员名单条目
+export interface AdminEntry {
+  userId: string;
+  name: string;
+  level: string;        // "super" | "normal"
+  createdAt: string;
 }
 
 // API 统一响应格式
