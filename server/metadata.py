@@ -174,22 +174,30 @@ def init_versions(key: str, uploader_ip: str) -> str:
         return meta[key]["current_version"]
 
 
-def add_version(key: str, uploader_ip: str) -> str:
+def add_version(key: str, uploader_ip: str,
+                owner_id: str = "", owner_name: str = "") -> str:
     """
     Add a new version entry for an existing file.
     Returns the new version string (e.g. 'V4').
+
+    版本记录同时写入操作者的飞书身份（owner_id / owner_name），但**不改动**
+    项目级的 owner_id —— 上传新版本不等于项目易主（需求 5.3）。
+    uploader_ip 继续写入，仅供审计展示。
     """
     with _store.transaction() as meta:
         if key not in meta:
             return ""
         if "versions" not in meta[key]:
             meta[key]["versions"] = {}
+        version_record = {
+            "upload_time": datetime.now().isoformat(),
+            "uploader_ip": uploader_ip,
+            "owner_id": owner_id or "",
+            "owner_name": owner_name or "",
+        }
         if "current_version" not in meta[key]:
             meta[key]["current_version"] = "V1"
-            meta[key]["versions"]["V1"] = {
-                "upload_time": datetime.now().isoformat(),
-                "uploader_ip": uploader_ip,
-            }
+            meta[key]["versions"]["V1"] = version_record
             return "V1"
 
         # Increment version number
@@ -201,10 +209,7 @@ def add_version(key: str, uploader_ip: str) -> str:
 
         new_version = f"V{current_num + 1}"
         meta[key]["current_version"] = new_version
-        meta[key]["versions"][new_version] = {
-            "upload_time": datetime.now().isoformat(),
-            "uploader_ip": uploader_ip,
-        }
+        meta[key]["versions"][new_version] = version_record
         return new_version
 
 
@@ -280,15 +285,25 @@ def set_file_meta(
     original_name: str = "",
     parent_key: str = None,
     product_line: str = "",
-    password: str = None
+    password: str = None,
+    owner_id: str = "",
+    owner_name: str = ""
 ) -> None:
-    """Set complete metadata for a file (used on upload)."""
+    """
+    Set complete metadata for a file (used on upload).
+
+    owner_id / owner_name 是所有权的真相来源（飞书 UserID + 姓名快照）；
+    uploader_ip 保留但降级为纯审计信息，不参与任何权限判定。
+    """
+    now = datetime.now().isoformat()
     with _store.transaction() as meta:
         meta[key] = {
             "title": title,
             "description": description,
+            "owner_id": (owner_id or "")[:64],
+            "owner_name": (owner_name or "")[:64],
             "uploader_ip": uploader_ip,
-            "upload_time": datetime.now().isoformat(),
+            "upload_time": now,
             "original_name": original_name,
         }
         if parent_key:
@@ -299,15 +314,52 @@ def set_file_meta(
             meta[key]["password"] = _hash_password_bcrypt(password) if password else None
         # init_upload_time is set only on first upload, never changed
         if "init_upload_time" not in meta[key]:
-            meta[key]["init_upload_time"] = datetime.now().isoformat()
+            meta[key]["init_upload_time"] = now
         # Initialize version tracking
         meta[key]["current_version"] = "V1"
         meta[key]["versions"] = {
             "V1": {
-                "upload_time": datetime.now().isoformat(),
+                "upload_time": now,
                 "uploader_ip": uploader_ip,
+                "owner_id": (owner_id or "")[:64],
+                "owner_name": (owner_name or "")[:64],
             }
         }
+
+
+def set_owner(key: str, owner_id: str, owner_name: str) -> bool:
+    """
+    指定项目负责人。返回 (旧负责人标识, 是否成功) 中的成功位；
+    调用方若需要旧值请用 get_file_meta 先读。
+    """
+    with _store.transaction() as meta:
+        if key not in meta:
+            return False
+        meta[key]["owner_id"] = (owner_id or "")[:64]
+        meta[key]["owner_name"] = (owner_name or "")[:64]
+        return True
+
+
+def set_owners_bulk(keys, owner_id: str, owner_name: str):
+    """
+    批量指定负责人，全有或全无：任一 key 不存在则整批不改动。
+
+    返回 (是否成功, 缺失的 key 列表, {key: 旧负责人标识})。
+    在单个事务里完成，避免部分成功留下一半改过一半没改的状态。
+    """
+    missing = []
+    previous = {}
+    with _store.transaction() as meta:
+        for key in keys:
+            if key not in meta:
+                missing.append(key)
+        if missing:
+            return False, missing, {}
+        for key in keys:
+            previous[key] = meta[key].get("owner_id", "") or ""
+            meta[key]["owner_id"] = (owner_id or "")[:64]
+            meta[key]["owner_name"] = (owner_name or "")[:64]
+    return True, [], previous
 
 
 def touch_file_meta(key: str, **fields) -> bool:

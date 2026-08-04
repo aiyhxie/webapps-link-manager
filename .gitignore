@@ -53,3 +53,4 @@ _wip_*/
 # backups — runtime state, never committed
 auth_sessions.json
 .auth_sessions_backups/
+metadata.pre-identity-*.json

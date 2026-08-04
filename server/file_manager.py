@@ -5,8 +5,12 @@ File management for WebApps Link Manager.
 - scan_webapps(): 扫描 webapps/ 目录下所有 HTML 文件，生成项目列表
 - upload_file(): 保存上传的 HTML 文件到 webapps/ 目录（支持版本管理）
 - extract_zip(): 解压 ZIP 文件到 webapps/ 子目录，支持 UTF-8/GBK/CP437 编码
-- delete_file(): 删除文件（需校验上传者 IP）
-- can_delete(): 检查用户是否有权限删除文件
+- delete_file(): 删除文件（权限由调用方以 allowed 参数传入）
+
+权限说明（改造后）：
+- 本模块不再自行判权。编辑/删除/版本操作的权限由 server/permissions.py 的
+  can_manage() 依据飞书身份算出，再以 allowed 布尔值传进来。
+- uploader_ip 仅作审计展示，不参与任何权限判定；所有权看 owner_id。
 
 版本管理：
 - 上传同名文件时：旧内容存档到 versions/ 目录，新内容写入原路径
@@ -300,6 +304,8 @@ def scan_webapps() -> List[Dict[str, Any]]:
                     )
                     or meta.get("upload_time")
                 ),
+                "ownerId": (meta.get("owner_id") or ""),
+                "ownerName": (meta.get("owner_name") or ""),
                 "isDir": False,
                 # URL-encode the path (Chinese/non-ASCII chars) so the copied
                 # link is recognized by IM tools like WeCom, which fail to
@@ -383,7 +389,9 @@ def scan_webapps() -> List[Dict[str, Any]]:
                         )
                         or meta.get("upload_time")
                     ),
-                    "isDir": False,
+                    "ownerId": (meta.get("owner_id") or ""),
+                "ownerName": (meta.get("owner_name") or ""),
+                "isDir": False,
                     # URL-encode the path (Chinese/non-ASCII chars) so the
                     # copied link is recognized by IM tools like WeCom.
                     "url": f"/protected/{quote(rel_path.as_posix())}" if has_password else f"/files/{quote(rel_path.as_posix())}",
@@ -453,7 +461,8 @@ def allocate_unique_project_name(base_name: str, base_title: str,
     return f"{stem}_{stamp}{ext}", f"{base_title or stem}_{stamp}"
 
 
-def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool, str, str]:
+def upload_file(file_data: bytes, filename: str, uploader_ip: str,
+                owner_id: str = "", owner_name: str = "") -> Tuple[bool, str, str]:
     """
     Save an uploaded HTML file to webapps directory as a NEW project.
 
@@ -498,6 +507,8 @@ def upload_file(file_data: bytes, filename: str, uploader_ip: str) -> Tuple[bool
             description=description,
             original_name=filename,
             product_line=product_line,
+            owner_id=owner_id,
+            owner_name=owner_name,
         )
 
         return True, f"已上传 {safe}", key
@@ -572,7 +583,8 @@ def _build_zip_name_mapping(zip_data: bytes) -> Dict[str, str]:
     return name_mapping
 
 
-def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]]:
+def extract_zip(zip_data: bytes, uploader_ip: str,
+                owner_id: str = "", owner_name: str = "") -> Tuple[bool, str, List[str]]:
     """
     Extract a ZIP file to webapps directory.
     Returns (success, message, list of extracted keys - one key per ZIP project)
@@ -698,6 +710,8 @@ def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]
                             description=description,
                             original_name="index.html",
                             product_line=product_line,
+                            owner_id=owner_id,
+                            owner_name=owner_name,
                         )
                         main_html_key = key
                     except Exception:
@@ -718,6 +732,8 @@ def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]
                         description=description,
                         original_name="index.html",
                         product_line=product_line,
+                        owner_id=owner_id,
+                        owner_name=owner_name,
                     )
                     main_html_key = key
                     break
@@ -738,7 +754,8 @@ def extract_zip(zip_data: bytes, uploader_ip: str) -> Tuple[bool, str, List[str]
         return False, f"解压失败: {str(e)}", []
 
 
-def extract_zip_for_version(zip_data: bytes, target_filename: str, uploader_ip: str) -> Tuple[bool, str, str]:
+def extract_zip_for_version(zip_data: bytes, target_filename: str, uploader_ip: str,
+                            owner_id: str = "", owner_name: str = "") -> Tuple[bool, str, str]:
     """
     Extract a ZIP file and update an existing project as a new version.
 
@@ -791,7 +808,8 @@ def extract_zip_for_version(zip_data: bytes, target_filename: str, uploader_ip: 
                 # ── Multi-file project: replace the ENTIRE project directory ──
                 project_dir = (WEBAPPS_DIR / rel_path).parent
                 success, msg = _replace_project_directory(
-                    project_dir, key, zf, name_mapping, all_names, main_entry, uploader_ip
+                    project_dir, key, zf, name_mapping, all_names, main_entry,
+                    uploader_ip, owner_id, owner_name
                 )
                 if not success:
                     return False, msg, ""
@@ -803,7 +821,7 @@ def extract_zip_for_version(zip_data: bytes, target_filename: str, uploader_ip: 
                     old_meta = metadata.get_file_meta(key)
                     prev_version = old_meta.get("current_version", "V1") if old_meta else "V1"
                     _archive_path(target_filename, prev_version).write_bytes(old_content)
-                    metadata.add_version(key, uploader_ip)
+                    metadata.add_version(key, uploader_ip, owner_id, owner_name)
                 current_path.write_bytes(main_content)
 
         # Update metadata (title/description autofill; preserve existing values)
@@ -841,7 +859,8 @@ def extract_zip_for_version(zip_data: bytes, target_filename: str, uploader_ip: 
 
 def _replace_project_directory(project_dir: Path, key: str, zf: "zipfile.ZipFile",
                                 name_mapping: Dict[str, str], all_names: List[str],
-                                main_entry: str, uploader_ip: str) -> Tuple[bool, str]:
+                                main_entry: str, uploader_ip: str,
+                                owner_id: str = "", owner_name: str = "") -> Tuple[bool, str]:
     """
     Archive the current project directory as a full .zip snapshot (if it
     exists), then clear it and write the ENTIRE contents of the new ZIP in
@@ -931,10 +950,12 @@ def _delete_all_archives(rel_path: str) -> None:
                 pass
 
 
-def delete_file(key: str, request_ip: str, is_admin: bool = False) -> Tuple[bool, str]:
+def delete_file(key: str, allowed: bool) -> Tuple[bool, str]:
     """
-    Delete a project if the request IP matches the uploader IP, or if the
-    caller is a logged-in admin (admins have full rights on every project).
+    Delete a project.
+
+    `allowed` 是路由层用 permissions.can_manage() 算好的结果。文件操作层不再
+    自己判权 —— 参数变成必传的布尔值，漏判会直接是 TypeError 而不是静默放行。
 
     For multi-file (directory) projects, the ENTIRE project directory is
     removed (not just index.html) so images/CSS/JS/sub-pages never linger
@@ -953,14 +974,8 @@ def delete_file(key: str, request_ip: str, is_admin: bool = False) -> Tuple[bool
     if not file_path.exists():
         return False, "文件不存在"
 
-    # Check permission (admins bypass the IP check entirely)
-    meta = metadata.get_file_meta(key)
-    if not meta:
-        # File exists on disk but no metadata - only admins may clean it up
-        if not is_admin:
-            return False, "无权删除此文件"
-    elif not is_admin and meta.get("uploader_ip") != request_ip:
-        return False, "无权删除：只能删除自己上传的文件"
+    if not allowed:
+        return False, "无权删除此项目"
 
     try:
         rel_path = Path(rel_path_str)
@@ -993,19 +1008,10 @@ def delete_file(key: str, request_ip: str, is_admin: bool = False) -> Tuple[bool
         return False, f"删除失败: {str(e)}"
 
 
-def can_delete(key: str, request_ip: str) -> bool:
-    """Check if a user can delete a file based on IP. Empty uploader_ip means file was set up by admin."""
-    meta = metadata.get_file_meta(key)
-    if not meta:
-        return False
-    stored_ip = meta.get("uploader_ip", "")
-    # Empty uploader_ip means no IP restriction (admin-managed file)
-    if not stored_ip:
-        return True
-    return stored_ip == request_ip
 
 
-def update_file_version(key: str, file_data: bytes, uploader_ip: str) -> Tuple[bool, str, str]:
+def update_file_version(key: str, file_data: bytes, uploader_ip: str,
+                        owner_id: str = "", owner_name: str = "") -> Tuple[bool, str, str]:
     """
     Update an EXISTING project with new single-HTML content as a new version.
 
@@ -1056,7 +1062,7 @@ def update_file_version(key: str, file_data: bytes, uploader_ip: str) -> Tuple[b
             project_dir = dest_path.parent
             if project_dir.exists() and any(project_dir.iterdir()):
                 _zip_directory_to(project_dir, _archive_dir_path(rel_path_str, prev_version))
-            metadata.add_version(key, uploader_ip)
+            metadata.add_version(key, uploader_ip, owner_id, owner_name)
             # Clear the directory (old resources are safely archived above)
             # and write back only the new single HTML file.
             shutil.rmtree(project_dir, ignore_errors=True)
@@ -1066,7 +1072,7 @@ def update_file_version(key: str, file_data: bytes, uploader_ip: str) -> Tuple[b
             # Single-file root project — unchanged legacy behavior.
             old_content = dest_path.read_bytes()
             _archive_path(rel_path_str, prev_version).write_bytes(old_content)
-            metadata.add_version(key, uploader_ip)
+            metadata.add_version(key, uploader_ip, owner_id, owner_name)
             dest_path.write_bytes(file_data)
 
         # Refresh metadata (preserve title/description/password/product_line)
@@ -1209,8 +1215,7 @@ def get_current_content(filename: str) -> Optional[bytes]:
     return None
 
 
-def restore_version_file(key: str, version: str, request_ip: str,
-                         is_admin: bool = False) -> Tuple[bool, str]:
+def restore_version_file(key: str, version: str, allowed: bool) -> Tuple[bool, str]:
     """
     Restore a historical version as the current version.
 
@@ -1222,7 +1227,7 @@ def restore_version_file(key: str, version: str, request_ip: str,
 
     Returns (success, message).
     """
-    if not is_admin and not can_delete(key, request_ip):
+    if not allowed:
         return False, "无权恢复此版本"
 
     filename = key[5:] if key.startswith("file:") else key
@@ -1277,15 +1282,13 @@ def restore_version_file(key: str, version: str, request_ip: str,
     return True, f"已恢复为 {version} 版本"
 
 
-def delete_version_file(key: str, version: str, request_ip: str,
-                        is_admin: bool = False) -> Tuple[bool, str]:
+def delete_version_file(key: str, version: str, allowed: bool) -> Tuple[bool, str]:
     """
     Delete a historical version's archive (new directory-zip format or
     legacy single-file format, whichever exists).
     Returns (success, message).
     """
-    # Check permission (admins may manage every project's versions)
-    if not is_admin and not can_delete(key, request_ip):
+    if not allowed:
         return False, "无权删除此版本"
 
     # Get filename from key

@@ -1,652 +1,555 @@
 """
 WebApps Link Manager - Flask Server
 
-功能说明：
-- 文件服务：提供 webapps/ 目录下 HTML 文件的访问
-- 文件管理 API：列表、上传、更新、删除
-- 管理员系统：登录、权限管理、日志查看
-- 密码保护：基于令牌的文件访问控制
-- 日志系统：记录管理员操作和文件操作
+身份与权限（飞书 SSO 改造后）：
+- 身份来自飞书扫码登录，会话持久化在 auth_sessions.json，重启不掉线
+- embedded 形态：单进程直连，身份只从会话 Cookie 解析，客户端传入的
+  X-Auth-* 头在 WSGI 层被删除
+- gateway 形态：Nginx 做 auth_request 并注入 X-Auth-* 头，仅当对端在
+  TRUSTED_GATEWAY_IPS 内才采信
+- 项目所有权看 owner_id（飞书 UserID）；uploader_ip 降级为纯审计信息
+- 管理员名单存在 metadata.json 的 _system_admin_list_，与飞书应用管理员解耦
+- 应急管理员通道单独绑回环地址，飞书故障时兜底
 
-数据结构：
-- metadata.json: 存储文件元数据（标题、描述、上传者IP、密码）和管理员信息
-- logs/webapps.log: 操作日志文件
+数据存储：
+- metadata.json  项目元数据 + 用户档案(_system_users_) + 管理员名单(_system_admin_list_)
+                 + 应急账号(_system_admins_)
+- auth_sessions.json  会话 / OAuth state / 跨域跳转凭证 / 应急失败计数
+- logs/audit.jsonl    结构化审计日志
 
 API 路由：
-- GET  /api/files           - 获取文件列表
-- POST /api/files/upload    - 上传文件（HTML 或 ZIP）
-- PUT  /api/files/<key>     - 更新文件信息
-- DELETE /api/files/<key>   - 删除文件
-- POST /api/files/<key>/password - 验证文件密码
-- GET  /api/admin/status    - 获取管理员状态
-- POST /api/admin/login     - 管理员登录
-- POST /api/admin/logout    - 管理员登出
-- GET  /api/admin/users     - 获取管理员列表
-- POST /api/admin/users     - 添加管理员
-- DELETE /api/admin/users/<username> - 删除管理员
-- POST /api/admin/password  - 修改密码
-- GET  /api/logs            - 获取日志列表
-- GET  /logs                - 日志查看页面
+- GET    /api/me                      当前登录者身份与权限
+- GET    /api/users                   用户档案列表（选人用）
+- GET    /api/files                   项目列表（含 canManage / ownerId）
+- POST   /api/files/upload            上传新项目
+- PUT    /api/files/<key>             更新项目信息或密码
+- DELETE /api/files/<key>             删除项目
+- POST   /api/files/<key>/password    校验项目访问密码，签发访问凭证
+- GET    /api/files/<key>/versions    版本列表
+- POST   /api/files/<key>/versions    上传新版本
+- PUT    /api/files/<key>/versions/<v>/restore   恢复版本
+- DELETE /api/files/<key>/versions/<v>           删除版本
+- POST   /api/projects/owner          批量指定负责人（超管）
+- GET    /api/admins                  管理员名单
+- POST   /api/admins                  添加普通管理员（超管）
+- DELETE /api/admins/<user_id>        移除管理员（超管）
+- GET    /api/logs                    审计日志查询
+- GET    /api/status /api/changelog    系统信息
 """
 
 import sys
-import json
-import secrets
-import hashlib
 import logging
 from pathlib import Path
-from typing import Dict
 
 from flask import (
-    Flask, request, jsonify, send_from_directory,
-    send_file
+    Flask, request, jsonify, send_from_directory, send_file, g, redirect
 )
 
 # Add server directory to path for imports
 _server_dir = Path(__file__).parent.resolve()
 sys.path.insert(0, str(_server_dir))
 
+import config
 from config import WEBAPPS_DIR, HOST, PORT, VERSION
 import metadata
 import file_manager
 import changelog
 import audit
+import permissions
+import user_directory
+from permissions import can_manage, can_assign_owner, can_manage_admins
+from auth import errors, identity, session_store, signing
+from auth import routes as auth_routes
+from auth import emergency
 
-# Minimal logger for internal warnings/errors (not the audit trail)
 logger = logging.getLogger("webapps")
 logger.setLevel(logging.WARNING)
 logger.addHandler(logging.StreamHandler())
 
-# In-memory token store: token -> {filename}
-# (No password stored — token is proof of prior password verification)
-_access_tokens: Dict[str, Dict] = {}
-
-# In-memory admin session store: token -> username
-_admin_sessions: Dict[str, str] = {}
-
-# One-time short-lived log viewer tokens: token -> expiry timestamp
-def _safe_cookie_name(filename: str) -> str:
-    """Generate an ASCII-safe, stable cookie name from a (possibly non-ASCII)
-    filename. Cookie names must be ASCII; filenames containing Chinese or other
-    non-ASCII chars would otherwise be mangled by the HTTP layer and break the
-    access-token round-trip. Hashing yields a deterministic ASCII-only name."""
-    digest = hashlib.sha256(filename.encode("utf-8")).hexdigest()[:32]
-    return f"file_token_{digest}"
+# 不要求认证的路径前缀：登录本身必须可达，否则无法完成登录
+_PUBLIC_PREFIXES = ("/auth/",)
 
 
 def create_app():
     app = Flask(__name__, template_folder="templates")
     app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100MB max upload
 
-    # Keep PRD.md changelog table in sync with changelog.json on startup
+    # embedded 形态下从 WSGI environ 删除所有客户端传入的 X-Auth-* 头。
+    # 这是结构性防护：应用根本看不到这些头，不依赖每个读取点自觉忽略。
+    app.wsgi_app = identity.StripAuthHeaders(
+        app.wsgi_app, enabled=(config.AUTH_MODE != "gateway"))
+
+    app.register_blueprint(auth_routes.bp)
+
     try:
         changelog.sync_prd_changelog()
     except Exception as e:
         logger.warning(f"PRD changelog sync failed on startup: {e}")
 
+    try:
+        stats = session_store.bootstrap()
+        logger.warning(
+            f"会话存储就绪：保留 {stats['sessions_kept']} 条，"
+            f"清理过期 {stats['sessions_dropped']} 条")
+    except Exception as e:
+        logger.warning(f"会话存储初始化异常：{e}")
+
+    # ── 请求级身份解析 ───────────────────────────────────────────────────────
+
+    def _is_public_path(path: str) -> bool:
+        return path.startswith(_PUBLIC_PREFIXES)
+
+    @app.before_request
+    def _resolve_identity():
+        g.actor = None
+        if _is_public_path(request.path):
+            return None
+        actor, error_status = identity.resolve_actor()
+        if actor is None:
+            if error_status == 403:
+                return jsonify({
+                    "success": False,
+                    "message": "请求来源不被信任",
+                }), 403
+            if identity.wants_html():
+                return redirect(
+                    identity.login_url(request.full_path.rstrip("?")), code=302)
+            return jsonify({
+                "success": False,
+                "message": "未登录或会话已过期，请重新登录",
+                "needLogin": True,
+            }), 401
+        g.actor = actor
+        return None
+
+    def actor() -> permissions.Actor:
+        return g.actor
+
     def get_client_ip():
-        """Get client IP from headers or remote_addr."""
-        ip = request.headers.get("X-Forwarded-For")
-        if ip:
-            return ip.split(",")[0].strip()
+        """
+        取来源 IP。**仅用于审计展示**，不参与任何权限判定。
+
+        这里仍然读 X-Forwarded-For：可信代理白名单的改造属于阶段一的独立事项，
+        不在本 spec 范围内。由于 IP 已经不再决定权限，伪造它的收益只剩下污染
+        审计日志的 ip 字段，危害等级远低于改造前。
+        """
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
         return request.headers.get("X-Real-IP", request.remote_addr or "127.0.0.1")
 
-    def get_current_admin():
-        """Get current admin username from session token."""
-        token = request.headers.get("X-Admin-Token", "")
-        return _admin_sessions.get(token, "")
-
-    def is_admin_logged_in():
-        """Check if admin is logged in."""
-        return bool(get_current_admin())
-
-    def is_super_admin_user():
-        """Check if current admin is super admin."""
-        username = get_current_admin()
-        return metadata.is_super_admin(username) if username else False
-
-    # ── Audit logging helpers ────────────────────────────────────────────────────
+    # ── 审计辅助 ─────────────────────────────────────────────────────────────
 
     def _project_title(key: str) -> str:
-        """Resolve a human-friendly project title from its key; fallback to key."""
         meta = metadata.get_file_meta(key)
         if meta and meta.get("title"):
             return meta["title"]
         return key[5:] if key.startswith("file:") else key
 
-    def audit_admin(action: str, target: str = "", detail: str = "", actor: str = None):
-        """Record a管理员 action (actor = admin name, plus source IP)."""
-        audit.log("admin", action,
-                  actor=(actor if actor is not None else get_current_admin()),
-                  ip=get_client_ip(), target=target, detail=detail)
+    def audit_admin(action: str, target: str = "", detail: str = ""):
+        a = actor()
+        audit.log("admin", action, ip=get_client_ip(), target=target, detail=detail,
+                  actor_id=(a.user_id if a else ""),
+                  actor_name=(a.display if a else ""))
 
     def audit_project(action: str, key: str, detail: str = ""):
-        """Record a project CRUD action. actor = admin name if logged in else IP."""
-        admin = get_current_admin()
-        ip = get_client_ip()
-        audit.log("project", action, actor=(admin or ip), ip=ip,
-                  target=_project_title(key), detail=detail)
+        a = actor()
+        audit.log("project", action, ip=get_client_ip(),
+                  target=_project_title(key), detail=detail,
+                  actor_id=(a.user_id if a else ""),
+                  actor_name=(a.display if a else ""))
 
     def audit_access(key: str, detail: str = ""):
-        """Record a project-level access (actor = viewer IP)."""
-        ip = get_client_ip()
-        audit.log("access", "查看项目", actor=ip, ip=ip,
-                  target=_project_title(key), detail=detail)
+        a = actor()
+        audit.log("access", "查看项目", ip=get_client_ip(),
+                  target=_project_title(key), detail=detail,
+                  actor_id=(a.user_id if a else audit.ANONYMOUS_ACTOR_ID),
+                  actor_name=(a.display if a else ""))
 
     def _project_key_for_path(filename: str):
-        """Return the project key if `filename` is a project ENTRY (root .html or
-        <dir>/index.html), else None — so static assets/sub-pages aren't logged."""
+        """只有项目入口才记访问日志，静态资源与子页面不记。"""
         if not filename or ".." in filename:
             return None
         parts = filename.split("/")
         if len(parts) == 1 and filename.lower().endswith(".html"):
-            return f"file:{filename}"          # root-level project
+            return f"file:{filename}"
         if len(parts) == 2 and parts[1].lower() == "index.html":
-            return f"file:{filename}"          # first-level folder project entry
+            return f"file:{filename}"
         return None
 
-    # ── API Routes ──────────────────────────────────────────────────────────────
+    def _deny(message: str, status: int = 403):
+        return jsonify({"success": False, "message": message}), status
 
-    @app.route("/api/admin/status", methods=["GET"])
-    def admin_status():
-        """Get admin login status."""
-        username = get_current_admin()
-        is_super = is_super_admin_user()
-        # Check if any admins exist
-        admins = metadata.get_admins()
-        has_admins = len(admins) > 0
-        must_change = metadata.must_change_password(username) if username else False
-        return jsonify({
-            "success": True,
-            "isLoggedIn": bool(username),
-            "username": username,
-            "isSuperAdmin": is_super,
-            "hasAdmins": has_admins,
-            "mustChangePassword": must_change,
-        })
+    # ── 当前用户与用户档案 ───────────────────────────────────────────────────
 
-    @app.route("/api/admin/setup", methods=["POST"])
-    def admin_setup():
-        """Setup initial admin (only works if no admins exist)."""
-        admins = metadata.get_admins()
-        if len(admins) > 0:
-            return jsonify({"success": False, "message": "系统已有管理员，请登录"}), 400
+    @app.route("/api/me", methods=["GET"])
+    def whoami():
+        return jsonify({"success": True, "data": actor().to_public()})
 
-        data = request.get_json()
-        username = data.get("username", "")
-        password = data.get("password", "")
+    @app.route("/api/users", methods=["GET"])
+    def list_users():
+        """
+        用户档案列表，供「指定负责人」「添加管理员」选人。
 
-        if not username or not password:
-            return jsonify({"success": False, "message": "请输入用户名和密码"}), 400
+        走的是最小权限路线（没申请飞书通讯录读取），所以候选只能是登录过本系统
+        的人 —— 这个限制在前端提示里要说清楚，否则超管会找不到想指定的同事。
+        """
+        return jsonify({"success": True, "data": user_directory.list_users()})
 
-        if len(username) < 2 or len(password) < 6:
-            return jsonify({"success": False, "message": "用户名至少2字符，密码至少6字符"}), 400
-
-        pwd_hash = metadata.hash_admin_password(password)
-        if metadata.add_admin(username, pwd_hash, force_password_change=True):
-            audit_admin("创建超级管理员", target=username, actor=username)
-            return jsonify({"success": True, "message": "管理员创建成功，请登录"})
-        else:
-            return jsonify({"success": False, "message": "创建失败"}), 500
-
-    @app.route("/api/admin/login", methods=["POST"])
-    def admin_login():
-        """Admin login."""
-        data = request.get_json()
-        username = data.get("username", "")
-        password = data.get("password", "")
-
-        if not username or not password:
-            return jsonify({"success": False, "message": "请输入用户名和密码"}), 400
-
-        if metadata.verify_admin_password(username, password):
-            token = secrets.token_urlsafe(32)
-            _admin_sessions[token] = username
-            is_super = metadata.is_super_admin(username)
-            must_change = metadata.must_change_password(username)
-            audit_admin("登录", detail=("超级管理员" if is_super else "普通管理员"), actor=username)
-            return jsonify({
-                "success": True,
-                "message": "登录成功",
-                "token": token,
-                "username": username,
-                "isSuperAdmin": is_super,
-                "mustChangePassword": must_change,
-            })
-        else:
-            audit_admin("登录失败", target=username, detail="用户名或密码错误", actor=username)
-            return jsonify({"success": False, "message": "用户名或密码错误"}), 401
-
-    @app.route("/api/admin/logout", methods=["POST"])
-    def admin_logout():
-        """Admin logout."""
-        token = request.headers.get("X-Admin-Token", "")
-        if token in _admin_sessions:
-            username = _admin_sessions[token]
-            del _admin_sessions[token]
-            audit_admin("退出登录", actor=username)
-        return jsonify({"success": True, "message": "已退出登录"})
-
-    @app.route("/api/admin/users", methods=["GET"])
-    def admin_list():
-        """List all admin users (super admin only)."""
-        if not is_admin_logged_in():
-            return jsonify({"success": False, "message": "未登录"}), 401
-        if not is_super_admin_user():
-            return jsonify({"success": False, "message": "权限不足"}), 403
-
-        users = metadata.get_admins()
-        return jsonify({"success": True, "data": users})
-
-    @app.route("/api/admin/users", methods=["POST"])
-    def admin_add():
-        """Add a new admin user (super admin only)."""
-        if not is_admin_logged_in():
-            return jsonify({"success": False, "message": "未登录"}), 401
-        if not is_super_admin_user():
-            return jsonify({"success": False, "message": "权限不足"}), 403
-
-        data = request.get_json()
-        username = data.get("username", "")
-        password = data.get("password", "")
-
-        if not username or not password:
-            return jsonify({"success": False, "message": "请输入用户名和密码"}), 400
-
-        if len(username) < 2 or len(password) < 6:
-            return jsonify({"success": False, "message": "用户名至少2字符，密码至少6字符"}), 400
-
-        pwd_hash = metadata.hash_admin_password(password)
-        if metadata.add_admin(username, pwd_hash):
-            audit_admin("添加管理员", target=username)
-            return jsonify({"success": True, "message": "管理员添加成功"})
-        else:
-            return jsonify({"success": False, "message": "用户名已存在"}), 400
-
-    @app.route("/api/admin/users/<username>", methods=["DELETE"])
-    def admin_delete(username):
-        """Delete an admin user (super admin only, cannot delete self)."""
-        if not is_admin_logged_in():
-            return jsonify({"success": False, "message": "未登录"}), 401
-        if not is_super_admin_user():
-            return jsonify({"success": False, "message": "权限不足"}), 403
-
-        current_user = get_current_admin()
-        if current_user == username:
-            return jsonify({"success": False, "message": "不能删除自己"}), 400
-
-        if metadata.remove_admin(username):
-            # Also logout if the deleted user is currently logged in
-            for token, uname in list(_admin_sessions.items()):
-                if uname == username:
-                    del _admin_sessions[token]
-            audit_admin("删除管理员", target=username, actor=current_user)
-            return jsonify({"success": True, "message": "管理员已删除"})
-        else:
-            return jsonify({"success": False, "message": "管理员不存在"}), 404
-
-    @app.route("/api/admin/password", methods=["POST"])
-    def admin_change_password():
-        """Change own password (any logged-in admin)."""
-        if not is_admin_logged_in():
-            return jsonify({"success": False, "message": "未登录"}), 401
-
-        data = request.get_json()
-        old_password = data.get("oldPassword", "")
-        new_password = data.get("newPassword", "")
-
-        if not old_password or not new_password:
-            return jsonify({"success": False, "message": "请输入旧密码和新密码"}), 400
-
-        if len(new_password) < 6:
-            return jsonify({"success": False, "message": "新密码至少6字符"}), 400
-
-        if old_password == new_password:
-            return jsonify({"success": False, "message": "新密码不能与旧密码相同"}), 400
-
-        username = get_current_admin()
-        if not metadata.verify_admin_password(username, old_password):
-            return jsonify({"success": False, "message": "旧密码错误"}), 400
-
-        new_hash = metadata.hash_admin_password(new_password)
-        if metadata.update_admin_password(username, new_hash):
-            metadata.clear_force_password_change(username)
-            audit_admin("修改密码", actor=username)
-            return jsonify({"success": True, "message": "密码已更新"})
-        else:
-            return jsonify({"success": False, "message": "密码更新失败"}), 500
+    # ── 项目列表 ─────────────────────────────────────────────────────────────
 
     @app.route("/api/files", methods=["GET"])
     def list_files():
-        """List all files with metadata."""
         files = file_manager.scan_webapps()
-        client_ip = get_client_ip()
-        admin_user = get_current_admin()
+        a = actor()
+        preview_origin = config.PREVIEW_ORIGIN
 
-        # Add canDelete flag based on IP or admin status
         for f in files:
-            f["canDelete"] = file_manager.can_delete(f["key"], client_ip) or bool(admin_user)
+            meta = metadata.get_file_meta(f["key"]) or {}
+            f["canManage"] = can_manage(meta, a)
+            f["ownerName"] = user_directory.get_display_name(
+                f.get("ownerId", ""), f.get("ownerName", "")) if f.get("ownerId") else ""
+            # 预览域绝对 URL：主机名取自配置而不是请求 Host 头，防 Host 头注入
+            if preview_origin:
+                f["url"] = f"{preview_origin}{f['url']}"
 
         return jsonify({
             "success": True,
             "data": files,
-            "baseUrl": f"http://{file_manager.get_local_ip()}:{PORT}",
+            "baseUrl": preview_origin or f"http://{file_manager.get_local_ip()}:{PORT}",
         })
+
+    # ── 上传 ─────────────────────────────────────────────────────────────────
 
     @app.route("/api/files/upload", methods=["POST"])
     def upload_file():
-        """Handle file or zip upload."""
+        """
+        上传新项目。任意已认证用户都可以创建新项目（需求 7.11），
+        新项目的负责人就是上传者。
+        """
+        a = actor()
+        if not a.user_id or not a.display:
+            return _deny("登录状态异常，请重新登录", 401)
+
         client_ip = get_client_ip()
-
         if "file" not in request.files:
-            return jsonify({"success": False, "message": "没有上传文件"}), 400
-
+            return _deny("没有上传文件", 400)
         file = request.files["file"]
         if file.filename == "":
-            return jsonify({"success": False, "message": "文件名为空"}), 400
+            return _deny("文件名为空", 400)
 
         original_filename = file.filename
-        # Check file type based on original filename extension (case-insensitive)
         original_lower = original_filename.lower()
 
-        # Determine if it's a zip or html
         if original_lower.endswith(".zip"):
             zip_data = file.read()
-            success, message, keys = file_manager.extract_zip(zip_data, client_ip)
+            success, message, keys = file_manager.extract_zip(
+                zip_data, client_ip, a.user_id, a.display)
             if success:
                 for k in (keys or []):
                     audit_project("新建项目", k, detail=f"ZIP上传 {original_filename}")
                 return jsonify({"success": True, "message": message, "keys": keys})
-            else:
-                return jsonify({"success": False, "message": message}), 400
+            return _deny(message, 400)
 
-        elif original_lower.endswith(".html"):
-            # For HTML files, preserve the original filename but sanitize for path traversal
-            # Only allow alphanumeric, Chinese chars, spaces, dashes, underscores, dots, and parentheses
+        if original_lower.endswith(".html"):
             import re
-            # Keep Chinese chars and common filename chars, remove path traversal attempts
-            safe_name = re.sub(r'[^\w\s\u4e00-\u9fff.\-()（）]', '', original_filename)
-            safe_name = safe_name.strip()
-            # Ensure it ends with .html (case-insensitive check already done)
+            safe_name = re.sub(r'[^\w\s\u4e00-\u9fff.\-()（）]', '', original_filename).strip()
             if not safe_name.lower().endswith(".html"):
                 safe_name = safe_name + ".html"
             file_data = file.read()
-            success, message, key = file_manager.upload_file(file_data, safe_name, client_ip)
+            success, message, key = file_manager.upload_file(
+                file_data, safe_name, client_ip, a.user_id, a.display)
             if success:
                 audit_project("新建项目", key, detail=f"HTML上传 {safe_name}")
                 return jsonify({"success": True, "message": message, "key": key})
-            else:
-                return jsonify({"success": False, "message": message}), 400
+            return _deny(message, 400)
 
-        else:
-            return jsonify({"success": False, "message": "只支持 HTML 或 ZIP 文件"}), 400
+        return _deny("只支持 HTML 或 ZIP 文件", 400)
+
+    # ── 更新项目信息 / 密码 ──────────────────────────────────────────────────
 
     @app.route("/api/files/<path:key>", methods=["PUT"])
     def update_file(key):
-        """Update file title, description, and/or product_line."""
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data:
-            return jsonify({"success": False, "message": "无效的请求数据"}), 400
+            return _deny("无效的请求数据", 400)
 
         title = data.get("title")
         description = data.get("description")
         product_line = data.get("productLine")
         password = data.get("password")
-
         if title is None and description is None and product_line is None and password is None:
-            return jsonify({"success": False, "message": "没有提供要更新的字段"}), 400
+            return _deny("没有提供要更新的字段", 400)
 
-        # Check if key exists
         existing = metadata.get_file_meta(key)
-
-        # Permission: uploader IP, or any logged-in admin (admins have full
-        # rights on every project). Legacy files with no metadata / no
-        # uploader_ip carry no IP restriction — same semantics as can_delete()
-        # — so hand-placed files stay editable.
-        client_ip = get_client_ip()
-        if existing and not file_manager.can_delete(key, client_ip) and not get_current_admin():
-            return jsonify({"success": False, "message": "无权编辑此项目"}), 403
         if not existing:
-            # Create metadata entry for file without metadata
-            if key.startswith("file:"):
-                rel_path = key[5:]
-                file_path = WEBAPPS_DIR / rel_path
-                if file_path.exists():
-                    metadata.set_file_meta(
-                        key=key,
-                        title=title or file_path.name,
-                        uploader_ip="",
-                        description=description or "",
-                        password=password,
-                    )
-                else:
-                    return jsonify({"success": False, "message": "文件不存在"}), 404
-            else:
-                return jsonify({"success": False, "message": "文件不存在"}), 404
+            rel_path = key[5:] if key.startswith("file:") else ""
+            if not rel_path or not (WEBAPPS_DIR / rel_path).exists():
+                return _deny("文件不存在", 404)
+            # 磁盘上有文件但没有元数据（手工放进去的历史遗留）：
+            # 只有管理员能给它补建元数据，避免任何人抢先认领
+            if not actor().is_admin:
+                return _deny("无权编辑此项目", 403)
+            metadata.set_file_meta(
+                key=key, title=title or Path(rel_path).name, uploader_ip="",
+                description=description or "", password=password,
+                owner_id="", owner_name="")
         else:
+            if not can_manage(existing, actor()):
+                return _deny("无权编辑此项目", 403)
             metadata.update_file_meta(key, title, description, product_line, password)
 
-        admin_user = get_current_admin()
         if password is not None:
             audit_project("设置密码" if password else "清除密码", key)
-        elif title is not None or description is not None or product_line is not None:
+        else:
             audit_project("编辑信息", key)
-
         return jsonify({"success": True, "message": "已更新"})
+
+    # ── 版本 ─────────────────────────────────────────────────────────────────
 
     @app.route("/api/files/<path:key>/versions", methods=["GET"])
     def get_versions(key):
-        """Get all versions for a file."""
         meta = metadata.get_file_meta(key)
         if not meta:
-            return jsonify({"success": False, "message": "文件不存在"}), 404
-        versions_info = metadata.get_versions(key)
-        return jsonify({
-            "success": True,
-            "data": versions_info,
-        })
+            return _deny("文件不存在", 404)
+        return jsonify({"success": True, "data": metadata.get_versions(key)})
 
     @app.route("/api/files/<path:key>/versions", methods=["POST"])
     def upload_new_version(key):
-        """Upload a new version for an existing file."""
+        a = actor()
         client_ip = get_client_ip()
-
-        # Resolve filename from key once
         filename = key[5:] if key.startswith("file:") else key
 
-        # Check permission - allow if can_delete OR admin OR file has no metadata (legacy file)
-        has_meta = metadata.get_file_meta(key) is not None
+        meta = metadata.get_file_meta(key)
         has_physical = (WEBAPPS_DIR / filename).exists()
-        if not has_meta and not has_physical:
-            return jsonify({"success": False, "message": "文件不存在"}), 404
-        if has_meta and not file_manager.can_delete(key, client_ip) and not get_current_admin():
-            return jsonify({"success": False, "message": "无权更新此项目"}), 403
+        if not meta and not has_physical:
+            return _deny("文件不存在", 404)
+        if not can_manage(meta, a):
+            return _deny("无权更新此项目", 403)
 
         if "file" not in request.files:
-            return jsonify({"success": False, "message": "没有上传文件"}), 400
+            return _deny("没有上传文件", 400)
+        upload = request.files["file"]
+        if upload.filename == "":
+            return _deny("文件名为空", 400)
+        lower = upload.filename.lower()
+        if not (lower.endswith(".zip") or lower.endswith(".html")):
+            return _deny("只支持 HTML 或 ZIP 文件", 400)
 
-        upload_file = request.files["file"]
-        if upload_file.filename == "":
-            return jsonify({"success": False, "message": "文件名为空"}), 400
-
-        original_lower = upload_file.filename.lower()
-
-        if not (original_lower.endswith(".zip") or original_lower.endswith(".html")):
-            return jsonify({"success": False, "message": "只支持 HTML 或 ZIP 文件"}), 400
-
-        file_data = upload_file.read()
-
-        if original_lower.endswith(".zip"):
-            # Handle ZIP: extract and update version
-            success, msg, _ = file_manager.extract_zip_for_version(file_data, filename, client_ip)
-            if success:
-                versions_info = metadata.get_versions(key)
-                current_v = versions_info.get("current_version", "V1")
-                audit_project("上传新版本", key, detail=f"ZIP -> {current_v}")
-                return jsonify({"success": True, "message": msg, "version": current_v})
-            else:
-                return jsonify({"success": False, "message": msg}), 400
+        file_data = upload.read()
+        if lower.endswith(".zip"):
+            success, msg, _ = file_manager.extract_zip_for_version(
+                file_data, filename, client_ip, a.user_id, a.display)
         else:
-            # Handle HTML: archive old content and save new (in place, preserving
-            # the project's real nested path derived from its key)
-            success, message, _ = file_manager.update_file_version(key, file_data, client_ip)
-            if success:
-                versions_info = metadata.get_versions(key)
-                current_v = versions_info.get("current_version", "V1")
-                audit_project("上传新版本", key, detail=f"-> {current_v}")
-                return jsonify({"success": True, "message": message, "version": current_v})
-            else:
-                return jsonify({"success": False, "message": message}), 400
+            success, msg, _ = file_manager.update_file_version(
+                key, file_data, client_ip, a.user_id, a.display)
+
+        if not success:
+            return _deny(msg, 400)
+        current_v = metadata.get_versions(key).get("current_version", "V1")
+        audit_project("上传新版本", key,
+                      detail=f"{'ZIP' if lower.endswith('.zip') else 'HTML'} -> {current_v}")
+        return jsonify({"success": True, "message": msg, "version": current_v})
 
     @app.route("/api/files/<path:key>/versions/<version>/restore", methods=["PUT"])
     def restore_version(key, version):
-        """Restore a historical version as the current version."""
-        client_ip = get_client_ip()
-        admin_user = get_current_admin()
-
-        if not file_manager.can_delete(key, client_ip) and not admin_user:
-            return jsonify({"success": False, "message": "无权恢复此版本"}), 403
-
-        success, message = file_manager.restore_version_file(
-            key, version, client_ip, is_admin=bool(admin_user))
+        meta = metadata.get_file_meta(key)
+        if not meta:
+            return _deny("文件不存在", 404)
+        if not can_manage(meta, actor()):
+            return _deny("无权恢复此版本", 403)
+        success, message = file_manager.restore_version_file(key, version, True)
         if success:
             audit_project("恢复版本", key, detail=f"-> {version}")
             return jsonify({"success": True, "message": message})
-        else:
-            return jsonify({"success": False, "message": message}), 400
+        return _deny(message, 400)
 
     @app.route("/api/files/<path:key>/versions/<version>", methods=["DELETE"])
     def delete_version(key, version):
-        """Delete a historical version."""
-        client_ip = get_client_ip()
-        admin_user = get_current_admin()
-
-        if not file_manager.can_delete(key, client_ip) and not admin_user:
-            return jsonify({"success": False, "message": "无权删除此版本"}), 403
-
-        success, message = file_manager.delete_version_file(
-            key, version, client_ip, is_admin=bool(admin_user))
+        meta = metadata.get_file_meta(key)
+        if not meta:
+            return _deny("文件不存在", 404)
+        if not can_manage(meta, actor()):
+            return _deny("无权删除此版本", 403)
+        success, message = file_manager.delete_version_file(key, version, True)
         if success:
             audit_project("删除版本", key, detail=f"{version}")
             return jsonify({"success": True, "message": message})
-        else:
-            return jsonify({"success": False, "message": message}), 400
+        return _deny(message, 400)
 
     @app.route("/api/files/<path:key>", methods=["DELETE"])
     def delete_file(key):
-        """Delete a project (uploader IP match, or any logged-in admin)."""
-        client_ip = get_client_ip()
-        admin_user = get_current_admin()
-        success, message = file_manager.delete_file(
-            key, client_ip, is_admin=bool(admin_user))
-
+        meta = metadata.get_file_meta(key)
+        allowed = can_manage(meta, actor())
+        if meta and not allowed:
+            return _deny("无权删除此项目", 403)
+        if not meta and not actor().is_admin:
+            # 无元数据的遗留文件只有管理员能清理
+            return _deny("无权删除此项目", 403)
+        # 先取标题再删，否则删完就查不到了
+        title = _project_title(key)
+        success, message = file_manager.delete_file(key, True)
         if success:
-            audit_project("删除项目", key)
+            a = actor()
+            audit.log("project", "删除项目", ip=get_client_ip(), target=title,
+                      actor_id=a.user_id, actor_name=a.display)
             return jsonify({"success": True, "message": message})
-        else:
-            status = 403 if "无权" in message else 404 if "不存在" in message else 400
-            return jsonify({"success": False, "message": message}), status
+        status = 404 if "不存在" in message else 400
+        return _deny(message, status)
+
+    # ── 指定负责人（超管）───────────────────────────────────────────────────
+
+    @app.route("/api/projects/owner", methods=["POST"])
+    def assign_owner():
+        """
+        批量指定负责人。校验顺序固定为 权限(403) → 参数(400) → 项目存在性(404)，
+        并且全有或全无 —— 任一项目标识不存在则整批不改动。
+        """
+        if not can_assign_owner(actor()):
+            return _deny("只有超级管理员可以指定负责人", 403)
+
+        data = request.get_json(silent=True) or {}
+        raw_keys = data.get("keys")
+        owner_id = (data.get("ownerId") or "").strip()
+        if not isinstance(raw_keys, list) or not owner_id:
+            return _deny("参数不完整", 400)
+
+        keys = list(dict.fromkeys(k for k in raw_keys if isinstance(k, str) and k))
+        if len(keys) == 0 or len(keys) > 100:
+            return _deny("项目数量必须在 1~100 之间", 400)
+
+        target = user_directory.get_user(owner_id)
+        if not target:
+            return _deny("该员工尚未登录过本系统，请让他先用飞书登录一次", 400)
+        owner_name = target.get("name") or owner_id
+
+        ok, missing, previous = metadata.set_owners_bulk(keys, owner_id, owner_name)
+        if not ok:
+            return _deny(f"项目不存在：{missing[0]}", 404)
+
+        for key in keys:
+            audit_project("指定负责人", key,
+                          detail=f"{previous.get(key) or '（无）'} -> {owner_id}")
+        return jsonify({"success": True,
+                        "message": f"已为 {len(keys)} 个项目指定负责人",
+                        "ownerName": owner_name})
+
+    # ── 管理员名单 ───────────────────────────────────────────────────────────
+
+    @app.route("/api/admins", methods=["GET"])
+    def admin_list():
+        return jsonify({"success": True, "data": user_directory.list_admins()})
+
+    @app.route("/api/admins", methods=["POST"])
+    def admin_add():
+        if not can_manage_admins(actor()):
+            return _deny("只有超级管理员可以维护管理员名单", 403)
+        data = request.get_json(silent=True) or {}
+        user_id = (data.get("userId") or "").strip()
+        if not user_id:
+            return _deny("缺少用户标识", 400)
+        ok, message = user_directory.add_admin(user_id)
+        if not ok:
+            return _deny(message, 400)
+        audit_admin("添加管理员", target=user_id, detail="普通管理员")
+        return jsonify({"success": True, "message": message})
+
+    @app.route("/api/admins/<user_id>", methods=["DELETE"])
+    def admin_remove(user_id):
+        if not can_manage_admins(actor()):
+            return _deny("只有超级管理员可以维护管理员名单", 403)
+        ok, message, status = user_directory.remove_admin(user_id, actor().user_id)
+        if not ok:
+            return _deny(message, status)
+        audit_admin("删除管理员", target=user_id)
+        return jsonify({"success": True, "message": message})
+
+    # ── 系统信息 ─────────────────────────────────────────────────────────────
 
     @app.route("/api/status", methods=["GET"])
     def status():
-        """Get server status."""
         return jsonify({
             "success": True,
             "status": "running",
             "ip": file_manager.get_local_ip(),
             "port": PORT,
             "webappsDir": str(WEBAPPS_DIR),
-            # Read live from changelog.json so newly recorded versions show
-            # without needing a server restart.
             "version": changelog.get_latest_version(),
+            "authMode": config.AUTH_MODE,
         })
 
     @app.route("/api/changelog", methods=["GET"])
     def get_changelog():
-        """Get all changelog entries (newest first)."""
-        entries = changelog.get_changelog_entries()
         return jsonify({
             "success": True,
-            "data": entries,
+            "data": changelog.get_changelog_entries(),
             "current_version": VERSION,
         })
 
+    # ── 项目访问密码与访问凭证 ──────────────────────────────────────────────
+
+    ACCESS_COOKIE = "wl_access"
+
+    def _access_cookie_name(key: str) -> str:
+        import hashlib
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+        return f"{ACCESS_COOKIE}_{digest}"
+
     @app.route("/api/files/<path:key>/session", methods=["GET"])
     def check_file_session(key):
-        """Check if the current session (cookie) has access to this protected file."""
-        filename = key[5:] if key.startswith("file:") else key
-        cookie_name = _safe_cookie_name(filename)
-        token = request.cookies.get(cookie_name, "")
-
         meta = metadata.get_file_meta(key)
         has_password = bool(meta and meta.get("password"))
-
         if not has_password:
             return jsonify({"success": True, "hasAccess": True, "hasPassword": False})
-
-        # Validate token: check it exists and matches the filename
-        is_valid = False
-        if token and token in _access_tokens:
-            token_data = _access_tokens[token]
-            if token_data["filename"] == filename:
-                is_valid = True
-
-        return jsonify({"success": True, "hasAccess": is_valid, "hasPassword": has_password})
+        token = request.cookies.get(_access_cookie_name(key), "")
+        valid = signing.verify_access_credential(
+            token, actor().user_id, key, meta.get("password"))
+        return jsonify({"success": True, "hasAccess": valid, "hasPassword": True})
 
     @app.route("/api/files/<path:key>/password", methods=["POST"])
     def check_password(key):
-        """Check if the provided password is correct and set HttpOnly cookie for access."""
-        data = request.get_json()
-        password = data.get("password", "") if data else ""
+        """
+        校验项目访问密码，通过则签发无状态访问凭证。
 
-        if metadata.check_file_password(key, password):
-            token = secrets.token_urlsafe(32)
-            # Get filename from key
-            filename = key[5:] if key.startswith("file:") else key
-            # Store token (no password stored — token itself grants access)
-            _access_tokens[token] = {
-                "filename": filename,
-            }
-            # Note: the actual project view is logged when /protected serves the
-            # entry page, so we don't log password verification separately here.
-            # Set HttpOnly cookie instead of returning token in response body
-            resp = jsonify({"success": True, "message": "密码正确"})
-            resp.set_cookie(
-                _safe_cookie_name(filename),
-                token,
-                max_age=365 * 24 * 60 * 60,  # 1 year
-                httponly=True,
-                samesite="Lax",
-                path="/"  # Must be / so both /api/* and /protected/* receive it
-            )
-            return resp
-        else:
-            return jsonify({"success": False, "message": "密码错误"}), 401
+        凭证绑定 用户 + 项目 + 密码版本，8 小时有效；密码一改，旧凭证在下次
+        校验时自动失效（密码版本对不上），不需要维护撤销列表。
+        """
+        a = actor()
+        data = request.get_json(silent=True) or {}
+        password = data.get("password", "")
+        if len(str(password)) > 128:
+            return _deny("密码过长", 400)
 
-    # ── Log Viewing ──────────────────────────────────────────────────────────────
+        blocked, remain = session_store.emergency_is_blocked(f"pwd:{a.user_id}:{key}")
+        if blocked:
+            return jsonify({"success": False,
+                            "message": f"尝试过于频繁，请 {remain // 60 + 1} 分钟后再试"}), 429
+
+        meta = metadata.get_file_meta(key)
+        if not metadata.check_file_password(key, password):
+            session_store.emergency_record_failure(f"pwd:{a.user_id}:{key}")
+            audit_project("密码校验失败", key)
+            return _deny("密码错误", 401)
+
+        session_store.emergency_clear_failures(f"pwd:{a.user_id}:{key}")
+        credential = signing.issue_access_credential(
+            a.user_id, key, (meta or {}).get("password"))
+        resp = jsonify({"success": True, "message": "密码正确"})
+        resp.set_cookie(
+            _access_cookie_name(key), credential,
+            max_age=config.ACCESS_CREDENTIAL_TTL, httponly=True,
+            secure=config.IS_PRODUCTION, samesite="Lax", path="/",
+            domain=identity.cookie_domain_for_request(),
+        )
+        return resp
+
+    # ── 审计日志 ─────────────────────────────────────────────────────────────
 
     @app.route("/api/logs", methods=["GET"])
     def get_logs():
-        """Get audit log entries (structured), paginated. Requires a valid
-        admin session token via X-Admin-Token header — any logged-in admin
-        (super or regular) can view the full log; there is no per-admin
-        scoping. Supports filtering:
-          - q:           keyword substring (action/target/detail/actor/ip/category)
-          - actor:       filter by operator name/IP shown in the actor field
-          - ip:          filter by source IP
-          - category:    project | admin | access
-          - action_type: create | delete | update | access (see audit.classify_action_type)
-          - page, pageSize: 1-indexed pagination (default pageSize=100)
-        """
-        admin_token = request.headers.get("X-Admin-Token", "")
-        if not admin_token or admin_token not in _admin_sessions:
-            return jsonify({"success": False, "message": "未登录"}), 401
-
-        q = request.args.get("q", "")
-        actor = request.args.get("actor", "")
-        ip = request.args.get("ip", "")
-        category = request.args.get("category", "")
-        action_type = request.args.get("action_type", "")
+        """任意已登录管理员均可查看全部日志；普通员工不可见。"""
+        if not actor().is_admin:
+            return _deny("需要管理员权限", 403)
         try:
             page = int(request.args.get("page", 1))
         except ValueError:
@@ -655,371 +558,197 @@ def create_app():
             page_size = int(request.args.get("pageSize", 100))
         except ValueError:
             page_size = 100
-
         try:
-            result = audit.query(q=q, actor=actor, ip=ip, category=category,
-                                  action_type=action_type, page=page, page_size=page_size)
-            return jsonify({
-                "success": True,
-                "logs": result["logs"],
-                "total": result["total"],
-                "page": result["page"],
-                "pageSize": result["pageSize"],
-            })
+            result = audit.query(
+                q=request.args.get("q", ""),
+                actor=request.args.get("actor", ""),
+                actor_id=request.args.get("actor_id", ""),
+                ip=request.args.get("ip", ""),
+                category=request.args.get("category", ""),
+                action_type=request.args.get("action_type", ""),
+                page=page, page_size=page_size)
+            return jsonify({"success": True, **result})
         except Exception as e:
             return jsonify({"success": False, "message": str(e)}), 500
 
-    @app.route("/logs", methods=["GET"])
-    def view_logs():
-        """Serve the log viewer page shell.
+    # ── 原型内容服务 ─────────────────────────────────────────────────────────
 
-        The shell contains no sensitive data — the real authorization boundary
-        is /api/logs, which requires a valid admin session token sent as the
-        X-Admin-Token header. The page's JS reads the token from same-origin
-        localStorage, so no token is ever placed in the URL.
+    def _sandbox_headers():
         """
-        return """
-        <!DOCTYPE html>
-        <html lang="zh-CN">
-        <head>
-            <meta charset="utf-8">
-            <title>系统日志 - WebApps</title>
-            <style>
-                * { box-sizing: border-box; margin: 0; padding: 0; }
-                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1e1e1e; color: #d4d4d4; min-height: 100vh; }
-                .header { background: #323232; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #404040; position: sticky; top: 0; z-index: 5; }
-                .header h1 { color: #fff; font-size: 18px; }
-                .btn { background: #0e639c; color: #fff; border: none; padding: 7px 16px; border-radius: 4px; cursor: pointer; font-size: 13px; }
-                .btn:hover { background: #1177bb; }
-                .filter-bar { background: #2a2a2a; padding: 12px 24px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid #404040; position: sticky; top: 51px; z-index: 4; }
-                .filter-bar input, .filter-bar select { background: #3c3c3c; border: 1px solid #555; color: #d4d4d4; padding: 6px 10px; border-radius: 4px; font-size: 13px; }
-                .filter-bar input { width: 220px; }
-                .filter-bar .hint { color: #777; font-size: 12px; margin-left: auto; }
-                .wrap { padding: 16px 24px; }
-                table { width: 100%; border-collapse: collapse; font-size: 13px; }
-                th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #333; vertical-align: top; }
-                th { color: #9aa0a6; font-weight: 500; position: sticky; top: 96px; background: #1e1e1e; }
-                tr:hover td { background: #262626; }
-                .time { color: #858585; white-space: nowrap; font-variant-numeric: tabular-nums; }
-                .cat { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; white-space: nowrap; }
-                .cat.project { background: rgba(78,201,176,.15); color: #4ec9b0; }
-                .cat.admin { background: rgba(86,156,214,.15); color: #569cd6; }
-                .cat.access { background: rgba(206,145,120,.15); color: #ce9178; }
-                .actor { color: #dcdcaa; }
-                .ip { color: #9aa0a6; font-family: 'Consolas','Monaco',monospace; white-space: nowrap; }
-                .action { color: #e8eaed; }
-                .action.danger { color: #f14c4c; }
-                .target { color: #cbd5e1; word-break: break-all; }
-                .detail { color: #777; }
-                .empty { text-align: center; padding: 60px; color: #666; }
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h1>📋 系统操作日志</h1>
-                <button class="btn" onclick="loadLogs()">🔄 刷新</button>
-            </div>
-            <div class="filter-bar">
-                <input type="text" id="q" placeholder="按关键字搜索…" oninput="debouncedLoad()">
-                <input type="text" id="actor" placeholder="按操作者筛选" oninput="debouncedLoad()">
-                <input type="text" id="ip" placeholder="按IP筛选" oninput="debouncedLoad()">
-                <select id="category" onchange="loadLogs(1)">
-                    <option value="">全部类别</option>
-                    <option value="project">项目相关</option>
-                    <option value="admin">管理员动作</option>
-                    <option value="access">访问记录</option>
-                </select>
-                <select id="action_type" onchange="loadLogs(1)">
-                    <option value="">全部事件</option>
-                    <option value="create">新增</option>
-                    <option value="update">修改</option>
-                    <option value="delete">删除</option>
-                    <option value="access">登录/访问</option>
-                </select>
-                <span class="hint" id="count"></span>
-            </div>
-            <div class="wrap" id="wrap">
-                <div class="empty">加载中…</div>
-            </div>
-            <div class="filter-bar" id="pager" style="display:none; justify-content:center;">
-                <button class="btn" onclick="prevPage()">‹ 上一页</button>
-                <span id="pageInfo" style="color:#ccc; font-size:13px;"></span>
-                <button class="btn" onclick="nextPage()">下一页 ›</button>
-            </div>
-            <script>
-                const CAT_NAME = { project: '项目', admin: '管理员', access: '访问' };
-                const PAGE_SIZE = 100;
-                let _timer = null;
-                let _page = 1;
-                let _totalPages = 1;
-                function debouncedLoad() { clearTimeout(_timer); _timer = setTimeout(function(){ loadLogs(1); }, 300); }
-                function esc(s) {
-                    return String(s == null ? '' : s)
-                        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-                        .replace(/"/g,'&quot;');
-                }
-                function prevPage() { if (_page > 1) loadLogs(_page - 1); }
-                function nextPage() { if (_page < _totalPages) loadLogs(_page + 1); }
-                async function loadLogs(page) {
-                    _page = page || _page || 1;
-                    const wrap = document.getElementById('wrap');
-                    const adminTok = localStorage.getItem('adminToken') || '';
-                    if (!adminTok) { wrap.innerHTML = '<div class="empty">请先在首页登录管理员账号，再打开本页面</div>'; return; }
-                    const q = document.getElementById('q').value.trim();
-                    const actor = document.getElementById('actor').value.trim();
-                    const ip = document.getElementById('ip').value.trim();
-                    const category = document.getElementById('category').value;
-                    const actionType = document.getElementById('action_type').value;
-                    const params = new URLSearchParams();
-                    if (q) params.set('q', q);
-                    if (actor) params.set('actor', actor);
-                    if (ip) params.set('ip', ip);
-                    if (category) params.set('category', category);
-                    if (actionType) params.set('action_type', actionType);
-                    params.set('page', String(_page));
-                    params.set('pageSize', String(PAGE_SIZE));
-                    try {
-                        const resp = await fetch('/api/logs?' + params.toString(), { headers: { 'X-Admin-Token': adminTok } });
-                        if (resp.status === 401) { wrap.innerHTML = '<div class="empty">会话已过期，请回首页重新登录管理员账号</div>'; return; }
-                        const data = await resp.json();
-                        if (data.success && Array.isArray(data.logs)) { render(data.logs, data.total || 0); }
-                        else { wrap.innerHTML = '<div class="empty">' + esc(data.message || '加载失败') + '</div>'; }
-                    } catch(e) {
-                        wrap.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>';
-                    }
-                }
-                function fmtTime(t) { return String(t || '').replace('T', ' '); }
-                function render(logs, total) {
-                    const wrap = document.getElementById('wrap');
-                    const pager = document.getElementById('pager');
-                    document.getElementById('count').textContent = '共 ' + total + ' 条';
-                    _totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-                    if (!logs.length) {
-                        wrap.innerHTML = '<div class="empty">暂无匹配的日志记录</div>';
-                        pager.style.display = 'none';
-                        return;
-                    }
-                    let rows = logs.map(function(e) {
-                        const cat = e.category || '';
-                        const danger = /删除|失败/.test(e.action || '') ? ' danger' : '';
-                        return '<tr>' +
-                            '<td class="time">' + esc(fmtTime(e.time)) + '</td>' +
-                            '<td><span class="cat ' + esc(cat) + '">' + esc(CAT_NAME[cat] || cat) + '</span></td>' +
-                            '<td class="actor">' + esc(e.actor) + '</td>' +
-                            '<td class="ip">' + esc(e.ip) + '</td>' +
-                            '<td class="action' + danger + '">' + esc(e.action) + '</td>' +
-                            '<td class="target">' + esc(e.target) + '</td>' +
-                            '<td class="detail">' + esc(e.detail) + '</td>' +
-                        '</tr>';
-                    }).join('');
-                    wrap.innerHTML = '<table><thead><tr>' +
-                        '<th>时间</th><th>类别</th><th>操作者</th><th>来源IP</th><th>操作</th><th>项目/对象</th><th>备注</th>' +
-                        '</tr></thead><tbody>' + rows + '</tbody></table>';
-                    pager.style.display = 'flex';
-                    document.getElementById('pageInfo').textContent = '第 ' + _page + ' / ' + _totalPages + ' 页';
-                }
-                loadLogs(1);
-            </script>
-        </body>
-        </html>
-        """
+        embedded 形态的缓解措施：给原型内容加 sandbox CSP，使它进入独立的
+        不透明源，读不到管理界面的 Cookie 与 localStorage。
 
-    # ── Static File Serving ──────────────────────────────────────────────────────
+        代价是依赖 localStorage 或同源 fetch 的原型会失效，因此可通过
+        PREVIEW_SANDBOX 关闭 —— 但关掉就等于恢复到接入 SSO 之前的风险水平。
+        gateway 形态用域名隔离，不需要这个。
+        """
+        if config.AUTH_MODE == "gateway" or not config.PREVIEW_SANDBOX:
+            return {"X-Content-Type-Options": "nosniff"}
+        return {
+            "Content-Security-Policy": "sandbox allow-scripts allow-forms allow-popups",
+            "X-Content-Type-Options": "nosniff",
+        }
+
+    def _serve_project_file(filename: str):
+        response = send_from_directory(WEBAPPS_DIR, filename)
+        for k, v in _sandbox_headers().items():
+            response.headers[k] = v
+        return response
 
     @app.route("/files/<path:filename>")
     def serve_file(filename):
-        """Serve files from webapps directory."""
-        # Only log project-level entry views (not static assets/sub-pages)
         pkey = _project_key_for_path(filename)
         if pkey:
+            meta = metadata.get_file_meta(pkey)
+            if meta and meta.get("password"):
+                return redirect(f"/protected/{filename}", code=302)
             audit_access(pkey)
-        return send_from_directory(WEBAPPS_DIR, filename)
+        return _serve_project_file(filename)
 
     @app.route("/protected/<path:filename>")
     def serve_protected_file(filename):
-        """Serve password-protected files using HttpOnly cookie token."""
         key = f"file:{filename}"
         meta = metadata.get_file_meta(key)
-
         if not meta or not meta.get("password"):
-            # No password required, serve normally
             pkey = _project_key_for_path(filename)
             if pkey:
                 audit_access(pkey)
-            return send_from_directory(WEBAPPS_DIR, filename)
+            return _serve_project_file(filename)
 
-        # Check token from cookie (secure, not in URL)
-        cookie_name = _safe_cookie_name(filename)
-        token = request.cookies.get(cookie_name, "")
+        token = request.cookies.get(_access_cookie_name(key), "")
+        if signing.verify_access_credential(
+                token, actor().user_id, key, meta.get("password")):
+            audit_access(key)
+            return _serve_project_file(filename)
+        return _password_prompt_page(key, filename)
 
-        # Validate token
-        is_valid_token = False
-        if token and token in _access_tokens:
-            token_data = _access_tokens[token]
-            if token_data["filename"] == filename:
-                is_valid_token = True
-                # Token remains valid for reuse
-
-        if not is_valid_token:
-            # Return password entry page
-            return """
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="utf-8">
-                <title>需要密码访问</title>
-                <style>
-                    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5; }
-                    .container { background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); text-align: center; max-width: 400px; width: 90%; }
-                    h2 { color: #333; margin-bottom: 20px; }
-                    input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-                    button { width: 100%; padding: 12px; background: #4285f4; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
-                    button:hover { background: #3367d6; }
-                    .error { color: #ea4335; margin-top: 10px; display: none; }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h2>🔒 此文件已加密</h2>
-                    <p style="color: #666;">请输入访问密码</p>
-                    <form method="POST" id="pwdForm">
-                        <input type="password" name="password" id="pwdInput" placeholder="请输入密码" required />
-                        <button type="submit">确认访问</button>
-                    </form>
-                    <p class="error" id="errorMsg">密码错误</p>
-                </div>
-                <script>
-                document.getElementById('pwdForm').onsubmit = async function(e) {
-                    e.preventDefault();
-                    const pwd = document.getElementById('pwdInput').value;
-                    try {
-                        const resp = await fetch(window.location.pathname.replace('/protected/', '/api/files/file:') + '/password', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({password: pwd})
-                        });
-                        const data = await resp.json();
-                        if (data.success) {
-                            // Password correct, cookie is set by server via Set-Cookie header
-                            // Reload to re-check cookie and serve the file
-                            window.location.reload();
-                        } else {
-                            document.getElementById('errorMsg').style.display = 'block';
-                        }
-                    } catch(e) {
-                        document.getElementById('errorMsg').style.display = 'block';
-                    }
-                };
-                </script>
-            </body>
-            </html>
-            """
-
-        pkey = _project_key_for_path(filename)
-        if pkey:
-            audit_access(pkey)
-        return send_from_directory(WEBAPPS_DIR, filename)
+    def _password_prompt_page(key: str, filename: str):
+        import html as _html
+        safe_key = _html.escape(key, quote=True)
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>需要密码访问</title>
+<style>
+ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+        display:flex;justify-content:center;align-items:center;min-height:100vh;
+        margin:0;background:#f1f3f4;color:#202124; }}
+ .card {{ background:#fff;padding:36px 40px;border-radius:12px;max-width:400px;
+         width:90%;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.12); }}
+ h2 {{ font-size:18px;margin:0 0 8px; }}
+ p {{ color:#5f6368;font-size:14px;margin:0 0 20px; }}
+ input {{ width:100%;padding:11px;border:1px solid #dadce0;border-radius:6px;
+         box-sizing:border-box;font-size:14px; }}
+ button {{ width:100%;padding:11px;margin-top:12px;background:#4285f4;color:#fff;
+          border:none;border-radius:6px;font-size:15px;cursor:pointer; }}
+ .err {{ color:#ea4335;font-size:13px;margin-top:10px;display:none; }}
+ @media (prefers-color-scheme: dark) {{
+   body {{ background:#202124;color:#e8eaed; }}
+   .card {{ background:#292a2d;box-shadow:none; }}
+   input {{ background:#202124;border-color:#5f6368;color:#e8eaed; }}
+ }}
+</style></head><body>
+<div class="card">
+  <h2>🔒 此项目已加密</h2>
+  <p>请输入访问密码</p>
+  <form id="f"><input type="password" id="p" placeholder="访问密码" required>
+  <button type="submit">确认访问</button></form>
+  <p class="err" id="e">密码错误</p>
+</div>
+<script>
+document.getElementById('f').onsubmit = async function(ev) {{
+  ev.preventDefault();
+  try {{
+    const r = await fetch('/api/files/' + encodeURIComponent('{safe_key}') + '/password', {{
+      method:'POST', credentials:'same-origin',
+      headers:{{'Content-Type':'application/json'}},
+      body: JSON.stringify({{password: document.getElementById('p').value}})
+    }});
+    const d = await r.json();
+    if (d.success) {{ window.location.reload(); }}
+    else {{ const e=document.getElementById('e'); e.textContent=d.message||'密码错误'; e.style.display='block'; }}
+  }} catch(_) {{ document.getElementById('e').style.display='block'; }}
+}};
+</script></body></html>""", 401
 
     @app.route("/assets/<path:filename>")
     def serve_assets(filename):
-        """Serve static assets (JS/CSS) from templates/assets/."""
-        assets_dir = Path(__file__).parent / "templates" / "assets"
-        return send_from_directory(assets_dir, filename)
+        return send_from_directory(Path(__file__).parent / "templates" / "assets",
+                                   filename)
 
     def _inject_base_href(content: bytes, filename: str, version: str) -> bytes:
-        """
-        Inject a <base href> pointing at the version's sub-resource route so
-        relative paths in the historical HTML (images/css/js/sub-pages)
-        resolve correctly instead of 404ing. Without this, the browser would
-        resolve e.g. "images/foo.png" relative to the current
-        /versions/<filename>/<version> URL, which doesn't match any route.
-        Harmless no-op for single-file projects with no relative resources.
-        """
         import re as _re
         from urllib.parse import quote
         safe_filename = quote(filename, safe="/")
-        base_tag = f'<base href="/versions/{safe_filename}/{version}/res/">'.encode("utf-8")
+        base_tag = f'<base href="/versions/{safe_filename}/{version}/res/">'.encode()
         match = _re.search(rb'<head[^>]*>', content, _re.IGNORECASE)
         if match:
-            insert_at = match.end()
-            return content[:insert_at] + base_tag + content[insert_at:]
+            return content[:match.end()] + base_tag + content[match.end():]
         return base_tag + content
 
     @app.route("/versions/<path:filename>/<version>")
     def serve_version(filename, version):
-        """Serve a historical version of a file."""
         key = f"file:{filename}"
-
-        # Check password protection
         meta = metadata.get_file_meta(key)
         if meta and meta.get("password"):
-            # Check if user has valid cookie for this file
-            cookie_name = _safe_cookie_name(filename)
-            token = request.cookies.get(cookie_name, "")
-            is_valid_token = False
-            if token and token in _access_tokens:
-                token_data = _access_tokens[token]
-                if token_data["filename"] == filename:
-                    is_valid_token = True
-            if not is_valid_token:
-                return """
-                <!DOCTYPE html>
-                <html><head><meta charset="utf-8"><title>需要密码访问</title></head>
-                <body style="font-family:sans-serif;text-align:center;padding:60px;">
-                <h2>🔒 此文件已加密，请从主页输入密码后访问</h2>
-                <p><a href="/">返回首页</a></p></body></html>
-                """, 401
+            token = request.cookies.get(_access_cookie_name(key), "")
+            if not signing.verify_access_credential(
+                    token, actor().user_id, key, meta.get("password")):
+                return _password_prompt_page(key, filename)
 
-        # Try historical version first
         content = file_manager.get_version_content(filename, version)
+        headers = {"Content-Type": "text/html; charset=utf-8", **_sandbox_headers()}
         if content is not None:
             audit_access(key, detail=f"历史版本 {version}")
-            html = _inject_base_href(content, filename, version)
-            return html, 200, {"Content-Type": "text/html; charset=utf-8"}
-
-        # Fall back to current version
+            return _inject_base_href(content, filename, version), 200, headers
         content = file_manager.get_current_content(filename)
         if content is not None:
             audit_access(key, detail=f"请求{version}，返回当前版本")
-            return content, 200, {"Content-Type": "text/html; charset=utf-8"}
-
+            return content, 200, headers
         return "文件不存在", 404
 
     @app.route("/versions/<path:filename>/<version>/res/<path:subpath>")
     def serve_version_subresource(filename, version, subpath):
-        """
-        Serve a sub-resource (image/CSS/JS/sub-page) from a historical
-        full-directory version archive, so previewing an old version of a
-        multi-file project renders correctly instead of showing broken
-        images/styles. Legacy single-file archives have no sub-resources by
-        definition, so a 404 here for those is expected, not a bug.
-        """
         content = file_manager.get_version_subresource(filename, version, subpath)
         if content is None:
             return "资源不存在", 404
         import mimetypes
         mime_type = mimetypes.guess_type(subpath)[0] or "application/octet-stream"
-        return content, 200, {"Content-Type": mime_type}
+        return content, 200, {"Content-Type": mime_type, **_sandbox_headers()}
 
-    # ── SPA Fallback ─────────────────────────────────────────────────────────────
+    # ── SPA ──────────────────────────────────────────────────────────────────
 
     @app.route("/", methods=["GET"])
     def index():
-        """Serve the React app."""
         return send_file(Path(__file__).parent / "templates" / "index.html")
 
     return app
 
 
 def main():
+    # 认证配置有误时在这里终止，不监听任何端口
+    config.abort_on_invalid_auth_config()
+
     app = create_app()
     local_ip = file_manager.get_local_ip()
-    print(f"=" * 50)
-    print(f"WebApps Link Manager 已启动")
-    print(f"=" * 50)
-    print(f"管理界面: http://{local_ip}:{PORT}/")
-    print(f"文件目录: {WEBAPPS_DIR}")
-    print(f"=" * 50)
+    print("=" * 56)
+    print("WebApps Link Manager 已启动")
+    print("=" * 56)
+    print(f"管理界面   : http://{local_ip}:{PORT}/")
+    print(f"文件目录   : {WEBAPPS_DIR}")
+    print(f"身份模式   : {config.AUTH_MODE}")
+    print(f"部署环境   : {config.DEPLOY_ENV}")
+    admins = user_directory.admin_count()
+    print(f"管理员数量 : {admins}" + ("（首个通过飞书应用管理员校验的登录者将成为超管）"
+                                     if admins == 0 else ""))
+    if config.EMERGENCY_ENABLED:
+        host, port = config.emergency_host_port()
+        print(f"应急通道   : http://{host}:{port}/emergency/login （仅本机可访问）")
+    print("=" * 56)
+
+    if config.EMERGENCY_ENABLED:
+        emergency.start_in_background()
+
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
 
 
