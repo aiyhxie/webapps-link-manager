@@ -88,14 +88,14 @@ graph TD
   - 启动钩子：清理过期记录并原子写回；文件损坏时从备份恢复，无备份则空集合启动 + 审计，不终止进程
   - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10, 3.14, 3.15, 3.16_
 
-- [ ] 4. 实现飞书开放平台客户端
+- [x] 4. 实现飞书开放平台客户端
   - 新建 `server/auth/feishu.py`，用 `urllib.request` + `ssl.create_default_context()` 实现，`timeout=5`，同一授权流程内不重试
   - 实现 `exchange_user_token(code, redirect_uri)`、`get_user_info(token)`、`is_app_admin(token, user_id)`
   - 统一异常 `FeishuError(code, msg)`，异常信息与日志中不出现 App Secret、`access_token`、授权码
   - 不新增 `requirements.txt` 依赖
   - _Requirements: 1.3, 1.6, 1.11, 1.12, 8.2, 12.5, 12.6, 12.7, 13.1, 13.5_
 
-- [ ] 5. 实现用户档案与管理员名单
+- [x] 5. 实现用户档案与管理员名单
   - 新建 `server/user_directory.py`，读写 `metadata.json` 中的 `_system_users_` 与 `_system_admin_list_`
   - 用户档案：`upsert_user(user_id, name)` 记录首次登录时间、更新姓名与最后登录时间，姓名截断到 64 字符
   - 管理员名单：`get_admin(user_id)`、`add_admin()`、`remove_admin()`、`count_super()`，级别取 `super` / `normal`，名单上限 100 条
