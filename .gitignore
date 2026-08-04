@@ -48,3 +48,8 @@ _wip_*/
 .*.lock
 .metadata_backups/
 .changelog_backups/
+
+# Auth session store (live sessions, OAuth states, handoff credentials) and its
+# backups — runtime state, never committed
+auth_sessions.json
+.auth_sessions_backups/

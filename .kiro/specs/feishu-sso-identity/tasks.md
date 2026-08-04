@@ -73,13 +73,13 @@ graph TD
   - 创建 `.env.example`，飞书凭据字段填占位符
   - _Requirements: 12.1, 12.2, 12.3, 12.4_
 
-- [ ] 2. 实现签名凭证工具
+- [x] 2. 实现签名凭证工具
   - 新建 `server/auth/signing.py`：`sign(payload: dict) -> str` 与 `verify(token: str, expected_typ: str) -> dict | None`，格式为 `b64u(json).b64u(hmac_sha256)`，校验用 `hmac.compare_digest()`
   - 签名密钥解析：`AUTH_SIGNING_SECRET` 优先；`embedded` 模式缺失时自动生成 32 字节随机值持久化到 `BASE_DIR/.auth_secret`（权限 0600）；`gateway` 模式缺失则启动终止
   - 把 `.auth_secret` 加入 `.gitignore`
   - _Requirements: 4.8, 12.2, 14.6_
 
-- [ ] 3. 实现会话存储
+- [x] 3. 实现会话存储
   - 新建 `server/auth/session_store.py`，用 `AtomicJSONStore` 包装 `BASE_DIR/auth_sessions.json`，容器为 `sessions` / `states` / `handoffs` / `emergency_failures`
   - 会话记录字段：`user_id`、`name`、`domain`（`admin`/`preview`）、`kind`（`feishu`/`emergency`）、`created_at`、`last_seen_at`、`expires_at`，时间统一 UTC 秒级整数，`expires_at = created_at + 2592000`
   - 实现 `create_session()`（256 位熵标识）、`get_valid_session()`、`touch()`（活跃时间 5 分钟节流，300 秒内不落盘）、`delete_session()`（按域删除，幂等）
